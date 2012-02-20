@@ -645,17 +645,11 @@ Sets the strategy used for notifications. Options are ``logging``,
 ``rabbit`` and ``noop``.
 For more information :doc:`Glance notifications <notifications>`
 
-* ``rabbit_host``
+* ``rabbit_addresses``
 
-Optional. Default: ``localhost``
+Optional. Default: ``localhost:5672``
 
-Host to connect to when using ``rabbit`` strategy.
-
-* ``rabbit_port``
-
-Optional. Default: ``5672``
-
-Port to connect to when using ``rabbit`` strategy.
+Host:port pairs of a RabbitMQ cluster to connect to when using ``rabbit`` strategy.
 
 * ``rabbit_use_ssl``
 

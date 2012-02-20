@@ -36,8 +36,7 @@ class RabbitStrategy(strategy.Strategy):
     """A notifier that puts a message on a queue when called."""
 
     opts = [
-        cfg.StrOpt('rabbit_host', default='localhost'),
-        cfg.IntOpt('rabbit_port', default=5672),
+        cfg.ListOpt('rabbit_addresses', default='localhost:5672'),
         cfg.BoolOpt('rabbit_use_ssl', default=False),
         cfg.StrOpt('rabbit_userid', default='guest'),
         cfg.StrOpt('rabbit_password', default='guest'),
@@ -77,13 +76,14 @@ class RabbitStrategy(strategy.Strategy):
             pass
         self.connection = None
 
-    def _connect(self):
+    def _connect(self, host, port)
         """Connect to rabbit.  Exceptions should be handled by the
         caller.
         """
+        
         log_info = {}
-        log_info['hostname'] = self._conf.rabbit_host
-        log_info['port'] = self._conf.rabbit_port
+        log_info['hostname'] = host
+        log_info['port'] = port
         if self.connection:
             logger.info(_("Reconnecting to AMQP server on "
                     "%(hostname)s:%(port)d") % log_info)
@@ -92,8 +92,8 @@ class RabbitStrategy(strategy.Strategy):
             logger.info(_("Connecting to AMQP server on "
                     "%(hostname)s:%(port)d") % log_info)
         self.connection = kombu.connection.BrokerConnection(
-                hostname=self._conf.rabbit_host,
-                port=self._conf.rabbit_port,
+                hostname=host,
+                port=port,
                 userid=self._conf.rabbit_userid,
                 password=self._conf.rabbit_password,
                 virtual_host=self._conf.rabbit_virtual_host,
@@ -124,9 +124,13 @@ class RabbitStrategy(strategy.Strategy):
     def reconnect(self):
         """Handles reconnecting and re-establishing queues."""
         while True:
+            adr = self._conf.rabbit_addresses
+            host, port = adr[self.retry_attempts % len(adr)].split(':')
+            port = int(port)
+
             self.retry_attempts += 1
             try:
-                self._connect()
+                self._connect(host, port)
                 return
             except self.connection_errors, e:
                 pass
@@ -143,8 +147,8 @@ class RabbitStrategy(strategy.Strategy):
             log_info = {}
             log_info['err_str'] = str(e)
             log_info['max_retries'] = self.max_retries
-            log_info['hostname'] = self._conf.rabbit_host
-            log_info['port'] = self._conf.rabbit_port
+            log_info['hostname'] = host
+            log_info['port'] = port
 
             if self.max_retries and self.retry_attempts >= self.max_retries:
                 logger.exception(_('Unable to connect to AMQP server on '
