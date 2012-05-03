@@ -7,7 +7,7 @@
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
 #
-#         https://www.apache.org/licenses/LICENSE-2.0
+#         http://www.apache.org/licenses/LICENSE-2.0
 #
 #    Unless required by applicable law or agreed to in writing, software
 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -15,69 +15,26 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""
-Tests a Glance API server which uses an Swift backend by default
+"""Functional test case that utilizes httplib2 against the API server"""
 
-This test requires that a real Swift account is available. It looks
-in a file GLANCE_TEST_SWIFT_CONF environ variable for the credentials to
-use.
-
-Note that this test clears the entire container from the Swift account
-for use by the test case, so make sure you supply credentials for
-test accounts only.
-
-If a connection cannot be established, all the test cases are
-skipped.
-"""
-
-import ConfigParser
 import datetime
 import hashlib
-import httplib
-import httplib2
 import json
-import os
 import tempfile
-import unittest
+
+import httplib2
 
 from glance.common import utils
-from glance.store.location import get_location_from_uri
 from glance.tests import functional
-from glance.tests.utils import execute, skip_if_disabled
+from glance.tests.utils import skip_if_disabled, minimal_headers
 
 FIVE_KB = 5 * 1024
 FIVE_GB = 5 * 1024 * 1024 * 1024
-TEST_VAR_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                            '..', 'var'))
 
 
-class TestSSL(functional.FunctionalTest):
+class TestApi(functional.FunctionalTest):
 
-    """Functional tests verifying SSL communication"""
-
-    def setUp(self):
-        if getattr(self, 'inited', False):
-            return
-
-        self.inited = False
-        self.disabled = True
-
-        self.key_file = os.path.join(TEST_VAR_DIR, 'privatekey.key')
-        if not os.path.exists(self.key_file):
-            self.disabled_message = "Could not find private key file"
-            self.inited = True
-            return
-
-        self.cert_file = os.path.join(TEST_VAR_DIR, 'certificate.crt')
-        if not os.path.exists(self.key_file):
-            self.disabled_message = "Could not find certificate file"
-            self.inited = True
-            return
-
-        self.inited = True
-        self.disabled = False
-
-        super(TestSSL, self).setUp()
+    """Functional tests using httplib2 against the API server"""
 
     @skip_if_disabled
     def test_get_head_simple_post(self):
@@ -113,55 +70,52 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
         # 1. GET /images/detail
         # Verify no public images
-        path = "https://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
         # 2. POST /images with public image named Image1
         # attribute and no custom properties. Verify a 200 OK is returned
         image_data = "*" * FIVE_KB
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': 'Image1',
-                   'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers,
+        headers = minimal_headers('Image1')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers,
                                          body=image_data)
         self.assertEqual(response.status, 201)
         data = json.loads(content)
+        image_id = data['image']['id']
         self.assertEqual(data['image']['checksum'],
                          hashlib.md5(image_data).hexdigest())
         self.assertEqual(data['image']['size'], FIVE_KB)
         self.assertEqual(data['image']['name'], "Image1")
         self.assertEqual(data['image']['is_public'], True)
 
-        image_id = data['image']['id']
-
         # 3. HEAD image
         # Verify image found now
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'HEAD')
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'HEAD')
         self.assertEqual(response.status, 200)
         self.assertEqual(response['x-image-meta-name'], "Image1")
 
         # 4. GET image
         # Verify all information on image we just added is correct
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
 
         expected_image_headers = {
@@ -169,8 +123,8 @@ class TestSSL(functional.FunctionalTest):
             'x-image-meta-name': 'Image1',
             'x-image-meta-is_public': 'True',
             'x-image-meta-status': 'active',
-            'x-image-meta-disk_format': '',
-            'x-image-meta-container_format': '',
+            'x-image-meta-disk_format': 'raw',
+            'x-image-meta-container_format': 'ovf',
             'x-image-meta-size': str(FIVE_KB)}
 
         expected_std_headers = {
@@ -196,14 +150,14 @@ class TestSSL(functional.FunctionalTest):
 
         # 5. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
 
         expected_result = {"images": [
-            {"container_format": None,
-             "disk_format": None,
+            {"container_format": "ovf",
+             "disk_format": "raw",
              "id": image_id,
              "name": "Image1",
              "checksum": "c2e5db72bd7fd153f53ede5da5a06de3",
@@ -212,17 +166,17 @@ class TestSSL(functional.FunctionalTest):
 
         # 6. GET /images/detail
         # Verify image and all its metadata
-        path = "https://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
 
         expected_image = {
             "status": "active",
             "name": "Image1",
             "deleted": False,
-            "container_format": None,
-            "disk_format": None,
+            "container_format": "ovf",
+            "disk_format": "raw",
             "id": image_id,
             "is_public": True,
             "deleted_at": None,
@@ -242,10 +196,10 @@ class TestSSL(functional.FunctionalTest):
         # Verify 200 returned
         headers = {'X-Image-Meta-Property-Distro': 'Ubuntu',
                    'X-Image-Meta-Property-Arch': 'x86_64'}
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'PUT', headers=headers)
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT', headers=headers)
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(data['image']['properties']['arch'], "x86_64")
@@ -253,17 +207,17 @@ class TestSSL(functional.FunctionalTest):
 
         # 8. GET /images/detail
         # Verify image and all its metadata
-        path = "https://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
 
         expected_image = {
             "status": "active",
             "name": "Image1",
             "deleted": False,
-            "container_format": None,
-            "disk_format": None,
+            "container_format": "ovf",
+            "disk_format": "raw",
             "id": image_id,
             "is_public": True,
             "deleted_at": None,
@@ -281,14 +235,14 @@ class TestSSL(functional.FunctionalTest):
 
         # 9. PUT image and remove a previously existing property.
         headers = {'X-Image-Meta-Property-Arch': 'x86_64'}
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'PUT', headers=headers)
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT', headers=headers)
         self.assertEqual(response.status, 200)
 
-        path = "https://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)['images'][0]
         self.assertEqual(len(data['properties']), 1)
@@ -297,20 +251,27 @@ class TestSSL(functional.FunctionalTest):
         # 10. PUT image and add a previously deleted property.
         headers = {'X-Image-Meta-Property-Distro': 'Ubuntu',
                    'X-Image-Meta-Property-Arch': 'x86_64'}
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'PUT', headers=headers)
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT', headers=headers)
         self.assertEqual(response.status, 200)
         data = json.loads(content)
 
-        path = "https://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images/detail" % ("0.0.0.0", self.api_port)
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)['images'][0]
         self.assertEqual(len(data['properties']), 2)
         self.assertEqual(data['properties']['arch'], "x86_64")
         self.assertEqual(data['properties']['distro'], "Ubuntu")
+
+        # DELETE image
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'DELETE')
+        self.assertEqual(response.status, 200)
 
         self.stop_servers()
 
@@ -333,7 +294,7 @@ class TestSSL(functional.FunctionalTest):
         - Verify image now in queued status
         4. PUT image with image data
         - Verify 200 returned
-        5. HEAD image
+        5. HEAD images
         - Verify image now in active status
         6. GET /images
         - Verify one public image
@@ -344,26 +305,24 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
         # 1. POST /images with public image named Image1
         # with no location or image data
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': 'Image1',
-                   'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        headers = minimal_headers('Image1')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
         data = json.loads(content)
         self.assertEqual(data['image']['checksum'], None)
         self.assertEqual(data['image']['size'], 0)
-        self.assertEqual(data['image']['container_format'], None)
-        self.assertEqual(data['image']['disk_format'], None)
+        self.assertEqual(data['image']['container_format'], 'ovf')
+        self.assertEqual(data['image']['disk_format'], 'raw')
         self.assertEqual(data['image']['name'], "Image1")
         self.assertEqual(data['image']['is_public'], True)
 
@@ -371,24 +330,24 @@ class TestSSL(functional.FunctionalTest):
 
         # 2. GET /images
         # Verify 1 public image
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(data['images'][0]['id'], image_id)
         self.assertEqual(data['images'][0]['checksum'], None)
         self.assertEqual(data['images'][0]['size'], 0)
-        self.assertEqual(data['images'][0]['container_format'], None)
-        self.assertEqual(data['images'][0]['disk_format'], None)
+        self.assertEqual(data['images'][0]['container_format'], 'ovf')
+        self.assertEqual(data['images'][0]['disk_format'], 'raw')
         self.assertEqual(data['images'][0]['name'], "Image1")
 
         # 3. HEAD /images
         # Verify status is in queued
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'HEAD')
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'HEAD')
         self.assertEqual(response.status, 200)
         self.assertEqual(response['x-image-meta-name'], "Image1")
         self.assertEqual(response['x-image-meta-status'], "queued")
@@ -398,10 +357,10 @@ class TestSSL(functional.FunctionalTest):
         # 4. PUT image with image data, verify 200 returned
         image_data = "*" * FIVE_KB
         headers = {'Content-Type': 'application/octet-stream'}
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'PUT', headers=headers,
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                             image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT', headers=headers,
                                          body=image_data)
         self.assertEqual(response.status, 200)
         data = json.loads(content)
@@ -411,194 +370,37 @@ class TestSSL(functional.FunctionalTest):
         self.assertEqual(data['image']['name'], "Image1")
         self.assertEqual(data['image']['is_public'], True)
 
-        # 5. HEAD image
+        # 5. HEAD /images
         # Verify status is in active
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               image_id)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'HEAD')
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'HEAD')
         self.assertEqual(response.status, 200)
         self.assertEqual(response['x-image-meta-name'], "Image1")
         self.assertEqual(response['x-image-meta-status'], "active")
 
         # 6. GET /images
         # Verify 1 public image still...
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(data['images'][0]['checksum'],
                          hashlib.md5(image_data).hexdigest())
         self.assertEqual(data['images'][0]['id'], image_id)
         self.assertEqual(data['images'][0]['size'], FIVE_KB)
-        self.assertEqual(data['images'][0]['container_format'], None)
-        self.assertEqual(data['images'][0]['disk_format'], None)
+        self.assertEqual(data['images'][0]['container_format'], 'ovf')
+        self.assertEqual(data['images'][0]['disk_format'], 'raw')
         self.assertEqual(data['images'][0]['name'], "Image1")
 
-        self.stop_servers()
-
-    @skip_if_disabled
-    def test_version_variations(self):
-        """
-        We test that various calls to the images and root endpoints are
-        handled properly, and that usage of the Accept: header does
-        content negotiation properly.
-        """
-
-        self.cleanup()
-        self.start_servers(**self.__dict__.copy())
-
-        versions = {'versions': [{
-            "id": "v1.1",
-            "status": "CURRENT",
-            "links": [{
-                "rel": "self",
-                "href": "https://0.0.0.0:%d/v1/" % self.api_port}]}, {
-            "id": "v1.0",
-            "status": "SUPPORTED",
-            "links": [{
-                "rel": "self",
-                "href": "https://0.0.0.0:%d/v1/" % self.api_port}]}]}
-        versions_json = json.dumps(versions)
-        images = {'images': []}
-        images_json = json.dumps(images)
-
-        # 0. GET / with no Accept: header
-        # Verify version choices returned.
-        # Bug lp:803260  no Accept header causes a 500 in glance-api
-        path = "https://%s:%d/" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-
-        # 1. GET /images with no Accept: header
-        # Verify version choices returned.
-        path = "https://%s:%d/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-
-        # 2. GET /v1/images with no Accept: header
-        # Verify empty images list returned.
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        # DELETE image
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'DELETE')
         self.assertEqual(response.status, 200)
-        self.assertEqual(content, images_json)
-
-        # 3. GET / with Accept: unknown header
-        # Verify version choices returned. Verify message in API log about
-        # unknown accept header.
-        path = "https://%s:%d/" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        headers = {'Accept': 'unknown'}
-        response, content = https.request(path, 'GET', headers=headers)
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-        self.assertTrue('Unknown accept header'
-                        in open(self.api_server.log_file).read())
-
-        # 4. GET / with an Accept: application/vnd.openstack.images-v1
-        # Verify empty image list returned
-        path = "https://%s:%d/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        headers = {'Accept': 'application/vnd.openstack.images-v1'}
-        response, content = https.request(path, 'GET', headers=headers)
-        self.assertEqual(response.status, 200)
-        self.assertEqual(content, images_json)
-
-        # 5. GET /images with a Accept: application/vnd.openstack.compute-v1
-        # header. Verify version choices returned. Verify message in API log
-        # about unknown accept header.
-        path = "https://%s:%d/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        headers = {'Accept': 'application/vnd.openstack.compute-v1'}
-        response, content = https.request(path, 'GET', headers=headers)
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-        self.assertTrue('Unknown accept header'
-                        in open(self.api_server.log_file).read())
-
-        # 6. GET /v1.0/images with no Accept: header
-        # Verify empty image list returned
-        path = "https://%s:%d/v1.0/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 200)
-        self.assertEqual(content, images_json)
-
-        # 7. GET /v1.a/images with no Accept: header
-        # Verify empty image list returned
-        path = "https://%s:%d/v1.a/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 200)
-        self.assertEqual(content, images_json)
-
-        # 8. GET /va.1/images with no Accept: header
-        # Verify version choices returned
-        path = "https://%s:%d/va.1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-
-        # 9. GET /versions with no Accept: header
-        # Verify version choices returned
-        path = "https://%s:%d/versions" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-
-        # 10. GET /versions with a Accept: application/vnd.openstack.images-v1
-        # header. Verify version choices returned.
-        path = "https://%s:%d/versions" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        headers = {'Accept': 'application/vnd.openstack.images-v1'}
-        response, content = https.request(path, 'GET', headers=headers)
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-
-        # 11. GET /v1/versions with no Accept: header
-        # Verify 404 returned
-        path = "https://%s:%d/v1/versions" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 404)
-
-        # 12. GET /v2/versions with no Accept: header
-        # Verify version choices returned
-        path = "https://%s:%d/v2/versions" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-
-        # 13. GET /images with a Accept: application/vnd.openstack.compute-v2
-        # header. Verify version choices returned. Verify message in API log
-        # about unknown version in accept header.
-        path = "https://%s:%d/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        headers = {'Accept': 'application/vnd.openstack.images-v2'}
-        response, content = https.request(path, 'GET', headers=headers)
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-        self.assertTrue('Unknown accept header'
-                        in open(self.api_server.log_file).read())
-
-        # 14. GET /v1.2/images with no Accept: header
-        # Verify version choices returned
-        path = "https://%s:%d/v1.2/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
-        self.assertEqual(response.status, 300)
-        self.assertEqual(content, versions_json)
-        self.assertTrue('Unknown version in versioned URI'
-                        in open(self.api_server.log_file).read())
 
         self.stop_servers()
 
@@ -620,20 +422,22 @@ class TestSSL(functional.FunctionalTest):
         # "adding" the image data.
         # Verify a 201 OK is returned
         headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Location': 'https://example.com/fakeimage',
+                   'X-Image-Meta-Location': 'http://example.com/fakeimage',
                    'X-Image-Meta-Size': str(FIVE_GB),
                    'X-Image-Meta-Name': 'Image1',
+                   'X-Image-Meta-disk_format': 'raw',
+                   'X-image-Meta-container_format': 'ovf',
                    'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
 
         # 2. HEAD /images
         # Verify image size is what was passed in, and not truncated
         path = response.get('location')
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'HEAD')
+        http = httplib2.Http()
+        response, content = http.request(path, 'HEAD')
         self.assertEqual(response.status, 200)
         self.assertEqual(response['x-image-meta-size'], str(FIVE_GB))
         self.assertEqual(response['x-image-meta-name'], 'Image1')
@@ -659,9 +463,9 @@ class TestSSL(functional.FunctionalTest):
         with tempfile.NamedTemporaryFile() as test_data_file:
             test_data_file.write("XXX")
             test_data_file.flush()
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST',
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST',
                             body=test_data_file.name)
         self.assertEqual(response.status, 400)
         expected = "Content-Type must be application/octet-stream"
@@ -680,11 +484,13 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
+
+        image_ids = []
 
         # 1. POST /images with three public images, and one private image
         # with various attributes
@@ -695,14 +501,16 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'vdi',
                    'X-Image-Meta-Size': '19',
                    'X-Image-Meta-Is-Public': 'True',
+                   'X-Image-Meta-Protected': 'True',
                    'X-Image-Meta-Property-pants': 'are on'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
         data = json.loads(content)
         self.assertEqual(data['image']['properties']['pants'], "are on")
         self.assertEqual(data['image']['is_public'], True)
+        image_ids.append(data['image']['id'])
 
         headers = {'Content-Type': 'application/octet-stream',
                    'X-Image-Meta-Name': 'My Image!',
@@ -711,14 +519,16 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'vhd',
                    'X-Image-Meta-Size': '20',
                    'X-Image-Meta-Is-Public': 'True',
+                   'X-Image-Meta-Protected': 'False',
                    'X-Image-Meta-Property-pants': 'are on'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
         data = json.loads(content)
         self.assertEqual(data['image']['properties']['pants'], "are on")
         self.assertEqual(data['image']['is_public'], True)
+        image_ids.append(data['image']['id'])
 
         headers = {'Content-Type': 'application/octet-stream',
                    'X-Image-Meta-Name': 'My Image!',
@@ -727,14 +537,16 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'ami',
                    'X-Image-Meta-Size': '21',
                    'X-Image-Meta-Is-Public': 'True',
+                   'X-Image-Meta-Protected': 'False',
                    'X-Image-Meta-Property-pants': 'are off'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
         data = json.loads(content)
         self.assertEqual(data['image']['properties']['pants'], "are off")
         self.assertEqual(data['image']['is_public'], True)
+        image_ids.append(data['image']['id'])
 
         headers = {'Content-Type': 'application/octet-stream',
                    'X-Image-Meta-Name': 'My Private Image',
@@ -742,18 +554,20 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Container-Format': 'ami',
                    'X-Image-Meta-Disk-Format': 'ami',
                    'X-Image-Meta-Size': '22',
-                   'X-Image-Meta-Is-Public': 'False'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+                   'X-Image-Meta-Is-Public': 'False',
+                   'X-Image-Meta-Protected': 'False'}
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
         data = json.loads(content)
         self.assertEqual(data['image']['is_public'], False)
+        image_ids.append(data['image']['id'])
 
         # 2. GET /images
         # Verify three public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
@@ -761,9 +575,9 @@ class TestSSL(functional.FunctionalTest):
         # 3. GET /images with name filter
         # Verify correct images returned with name
         params = "name=My%20Image!"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 2)
@@ -773,9 +587,9 @@ class TestSSL(functional.FunctionalTest):
         # 4. GET /images with status filter
         # Verify correct images returned with status
         params = "status=queued"
-        path = "https://%s:%d/v1/images/detail?%s" % (
+        path = "http://%s:%d/v1/images/detail?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
@@ -783,9 +597,9 @@ class TestSSL(functional.FunctionalTest):
             self.assertEqual(image['status'], "queued")
 
         params = "status=active"
-        path = "https://%s:%d/v1/images/detail?%s" % (
+        path = "http://%s:%d/v1/images/detail?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 0)
@@ -793,9 +607,9 @@ class TestSSL(functional.FunctionalTest):
         # 5. GET /images with container_format filter
         # Verify correct images returned with container_format
         params = "container_format=ovf"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 2)
@@ -805,9 +619,9 @@ class TestSSL(functional.FunctionalTest):
         # 6. GET /images with disk_format filter
         # Verify correct images returned with disk_format
         params = "disk_format=vdi"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 1)
@@ -817,9 +631,9 @@ class TestSSL(functional.FunctionalTest):
         # 7. GET /images with size_max filter
         # Verify correct images returned with size <= expected
         params = "size_max=20"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 2)
@@ -829,9 +643,9 @@ class TestSSL(functional.FunctionalTest):
         # 8. GET /images with size_min filter
         # Verify correct images returned with size >= expected
         params = "size_min=20"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 2)
@@ -842,9 +656,9 @@ class TestSSL(functional.FunctionalTest):
         # Verify correct images returned with property
         # Bug lp:803656  Support is_public in filtering
         params = "is_public=None"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 4)
@@ -853,9 +667,9 @@ class TestSSL(functional.FunctionalTest):
         # Verify correct images returned with property
         # Bug lp:803656  Support is_public in filtering
         params = "is_public=False"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 1)
@@ -866,34 +680,58 @@ class TestSSL(functional.FunctionalTest):
         # Verify correct images returned with property
         # Bug lp:803656  Support is_public in filtering
         params = "is_public=True"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
         for image in data['images']:
             self.assertNotEqual(image['name'], "My Private Image")
 
-        # 12. GET /images with property filter
+        # 12. Get /images with protected=False filter
+        # Verify correct images returned with property
+        params = "protected=False"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+        data = json.loads(content)
+        self.assertEqual(len(data['images']), 2)
+        for image in data['images']:
+            self.assertNotEqual(image['name'], "Image1")
+
+        # 13. Get /images with protected=True filter
+        # Verify correct images returned with property
+        params = "protected=True"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+        data = json.loads(content)
+        self.assertEqual(len(data['images']), 1)
+        for image in data['images']:
+            self.assertEqual(image['name'], "Image1")
+
+        # 14. GET /images with property filter
         # Verify correct images returned with property
         params = "property-pants=are%20on"
-        path = "https://%s:%d/v1/images/detail?%s" % (
+        path = "http://%s:%d/v1/images/detail?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 2)
         for image in data['images']:
             self.assertEqual(image['properties']['pants'], "are on")
 
-        # 13. GET /images with property filter and name filter
+        # 15. GET /images with property filter and name filter
         # Verify correct images returned with property and name
         # Make sure you quote the url when using more than one param!
         params = "name=My%20Image!&property-pants=are%20on"
-        path = "https://%s:%d/v1/images/detail?%s" % (
+        path = "http://%s:%d/v1/images/detail?%s" % (
                 "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 1)
@@ -901,27 +739,94 @@ class TestSSL(functional.FunctionalTest):
             self.assertEqual(image['properties']['pants'], "are on")
             self.assertEqual(image['name'], "My Image!")
 
-        # 14. GET /images with past changes-since filter
-        dt1 = datetime.datetime.utcnow() - datetime.timedelta(1)
-        iso1 = utils.isotime(dt1)
-        params = "changes-since=%s" % iso1
-        path = "https://%s:%d/v1/images?%s" % ("0.0.0.0",
-                                               self.api_port, params)
-        response, content = https.request(path, 'GET')
+        # 16. GET /images with past changes-since filter
+        yesterday = utils.isotime(datetime.datetime.utcnow() -
+                                  datetime.timedelta(1))
+        params = "changes-since=%s" % yesterday
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
 
-        # 15. GET /images with future changes-since filter
-        dt2 = datetime.datetime.utcnow() + datetime.timedelta(1)
-        iso2 = utils.isotime(dt2)
-        params = "changes-since=%s" % iso2
-        path = "https://%s:%d/v1/images?%s" % ("0.0.0.0",
-                                               self.api_port, params)
-        response, content = https.request(path, 'GET')
+        # one timezone west of Greenwich equates to an hour ago
+        # taking care to pre-urlencode '+' as '%2B', otherwise the timezone
+        # '+' is wrongly decoded as a space
+        # TODO(eglynn): investigate '+' --> <SPACE> decoding, an artifact
+        # of WSGI/webob dispatch?
+        now = datetime.datetime.utcnow()
+        hour_ago = now.strftime('%Y-%m-%dT%H:%M:%S%%2B01:00')
+        params = "changes-since=%s" % hour_ago
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+        data = json.loads(content)
+        self.assertEqual(len(data['images']), 3)
+
+        # 17. GET /images with future changes-since filter
+        tomorrow = utils.isotime(datetime.datetime.utcnow() +
+                                 datetime.timedelta(1))
+        params = "changes-since=%s" % tomorrow
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 0)
+
+        # one timezone east of Greenwich equates to an hour from now
+        now = datetime.datetime.utcnow()
+        hour_hence = now.strftime('%Y-%m-%dT%H:%M:%S-01:00')
+        params = "changes-since=%s" % hour_hence
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+        data = json.loads(content)
+        self.assertEqual(len(data['images']), 0)
+
+        # 18. GET /images with size_min filter
+        # Verify correct images returned with size >= expected
+        params = "size_min=-1"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 400)
+        self.assertTrue("filter size_min got -1" in content)
+
+        # 19. GET /images with size_min filter
+        # Verify correct images returned with size >= expected
+        params = "size_max=-1"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 400)
+        self.assertTrue("filter size_max got -1" in content)
+
+        # 20. GET /images with size_min filter
+        # Verify correct images returned with size >= expected
+        params = "min_ram=-1"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 400)
+        self.assertTrue("Bad value passed to filter min_ram got -1" in content)
+
+        # 21. GET /images with size_min filter
+        # Verify correct images returned with size >= expected
+        params = "protected=imalittleteapot"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 400)
+        self.assertTrue("protected got imalittleteapot" in content)
+
+        # 22. GET /images with size_min filter
+        # Verify correct images returned with size >= expected
+        params = "is_public=imalittleteapot"
+        path = "http://%s:%d/v1/images?%s" % (
+               "0.0.0.0", self.api_port, params)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 400)
+        self.assertTrue("is_public got imalittleteapot" in content)
 
         self.stop_servers()
 
@@ -935,91 +840,96 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
+        image_ids = []
+
         # 1. POST /images with three public images with various attributes
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': 'Image1',
-                   'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        headers = minimal_headers('Image1')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
+        image_ids.append(json.loads(content)['image']['id'])
 
-        image_ids = [data['image']['id']]
-
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': 'Image2',
-                   'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        headers = minimal_headers('Image2')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
+        image_ids.append(json.loads(content)['image']['id'])
 
-        image_ids.append(data['image']['id'])
-
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': 'Image3',
-                   'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        headers = minimal_headers('Image3')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
+        image_ids.append(json.loads(content)['image']['id'])
 
-        image_ids.append(data['image']['id'])
+        # 2. GET /images with all images
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+        images = json.loads(content)['images']
+        self.assertEqual(len(images), 3)
 
-        # 2. GET /images with limit of 2
+        # 3. GET /images with limit of 2
         # Verify only two images were returned
         params = "limit=2"
-        path = "https://%s:%d/v1/images?%s" % (
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
-        data = json.loads(content)
-        self.assertEqual(len(data['images']), 2)
-        self.assertEqual(data['images'][0]['id'], image_ids[2])
-        self.assertEqual(data['images'][1]['id'], image_ids[1])
+        data = json.loads(content)['images']
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[0]['id'], images[0]['id'])
+        self.assertEqual(data[1]['id'], images[1]['id'])
 
-        # 3. GET /images with marker
+        # 4. GET /images with marker
         # Verify only two images were returned
-        params = "marker=%s" % image_ids[2]
-        path = "https://%s:%d/v1/images?%s" % (
+        params = "marker=%s" % images[0]['id']
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
-        data = json.loads(content)
-        self.assertEqual(len(data['images']), 2)
-        self.assertEqual(data['images'][0]['id'], image_ids[1])
-        self.assertEqual(data['images'][1]['id'], image_ids[0])
+        data = json.loads(content)['images']
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[0]['id'], images[1]['id'])
+        self.assertEqual(data[1]['id'], images[2]['id'])
 
-        # 4. GET /images with marker and limit
+        # 5. GET /images with marker and limit
         # Verify only one image was returned with the correct id
-        params = "limit=1&marker=%s" % image_ids[1]
-        path = "https://%s:%d/v1/images?%s" % (
+        params = "limit=1&marker=%s" % images[1]['id']
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
-        data = json.loads(content)
-        self.assertEqual(len(data['images']), 1)
-        self.assertEqual(data['images'][0]['id'], image_ids[0])
+        data = json.loads(content)['images']
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['id'], images[2]['id'])
 
-        # 5. GET /images/detail with marker and limit
+        # 6. GET /images/detail with marker and limit
         # Verify only one image was returned with the correct id
-        params = "limit=1&marker=%s" % image_ids[2]
-        path = "https://%s:%d/v1/images?%s" % (
+        params = "limit=1&marker=%s" % images[1]['id']
+        path = "http://%s:%d/v1/images?%s" % (
                "0.0.0.0", self.api_port, params)
-        response, content = https.request(path, 'GET')
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
-        data = json.loads(content)
-        self.assertEqual(len(data['images']), 1)
-        self.assertEqual(data['images'][0]['id'], image_ids[1])
+        data = json.loads(content)['images']
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['id'], images[2]['id'])
+
+        # DELETE images
+        for image_id in image_ids:
+            path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                                  image_id)
+            http = httplib2.Http()
+            response, content = http.request(path, 'DELETE')
+            self.assertEqual(response.status, 200)
 
         self.stop_servers()
 
@@ -1033,13 +943,14 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
         # 1. POST /images with three public images with various attributes
+        image_ids = []
         headers = {'Content-Type': 'application/octet-stream',
                    'X-Image-Meta-Name': 'Image1',
                    'X-Image-Meta-Status': 'active',
@@ -1047,13 +958,11 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'vdi',
                    'X-Image-Meta-Size': '19',
                    'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
-
-        image_ids = [data['image']['id']]
+        image_ids.append(json.loads(content)['image']['id'])
 
         headers = {'Content-Type': 'application/octet-stream',
                    'X-Image-Meta-Name': 'ASDF',
@@ -1062,13 +971,11 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'iso',
                    'X-Image-Meta-Size': '2',
                    'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
-
-        image_ids.append(data['image']['id'])
+        image_ids.append(json.loads(content)['image']['id'])
 
         headers = {'Content-Type': 'application/octet-stream',
                    'X-Image-Meta-Name': 'XYZ',
@@ -1077,19 +984,17 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'ami',
                    'X-Image-Meta-Size': '5',
                    'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
-
-        image_ids.append(data['image']['id'])
+        image_ids.append(json.loads(content)['image']['id'])
 
         # 2. GET /images with no query params
         # Verify three public images sorted by created_at desc
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
@@ -1099,10 +1004,9 @@ class TestSSL(functional.FunctionalTest):
 
         # 3. GET /images sorted by name asc
         params = 'sort_key=name&sort_dir=asc'
-        path = "https://%s:%d/v1/images?%s" % ("0.0.0.0",
-                                               self.api_port, params)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
@@ -1112,22 +1016,21 @@ class TestSSL(functional.FunctionalTest):
 
         # 4. GET /images sorted by size desc
         params = 'sort_key=size&sort_dir=desc'
-        path = "https://%s:%d/v1/images?%s" % ("0.0.0.0",
-                                               self.api_port, params)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 3)
         self.assertEqual(data['images'][0]['id'], image_ids[0])
         self.assertEqual(data['images'][1]['id'], image_ids[2])
         self.assertEqual(data['images'][2]['id'], image_ids[1])
+
         # 5. GET /images sorted by size desc with a marker
         params = 'sort_key=size&sort_dir=desc&marker=%s' % image_ids[0]
-        path = "https://%s:%d/v1/images?%s" % ("0.0.0.0",
-                                               self.api_port, params)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 2)
@@ -1136,13 +1039,20 @@ class TestSSL(functional.FunctionalTest):
 
         # 6. GET /images sorted by name asc with a marker
         params = 'sort_key=name&sort_dir=asc&marker=%s' % image_ids[2]
-        path = "https://%s:%d/v1/images?%s" % ("0.0.0.0",
-                                               self.api_port, params)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images?%s" % ("0.0.0.0", self.api_port, params)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         data = json.loads(content)
         self.assertEqual(len(data['images']), 0)
+
+        # DELETE images
+        for image_id in image_ids:
+            path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                                  image_id)
+            http = httplib2.Http()
+            response, content = http.request(path, 'DELETE')
+            self.assertEqual(response.status, 200)
 
         self.stop_servers()
 
@@ -1156,9 +1066,9 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
@@ -1170,13 +1080,12 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Disk-Format': 'vdi',
                    'X-Image-Meta-Size': '19',
                    'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 201)
-        data = json.loads(content)
 
-        image_id = data['image']['id']
+        image = json.loads(content)['image']
 
         # 2. POST /images with public image named Image1, and ID: 1
         headers = {'Content-Type': 'application/octet-stream',
@@ -1185,15 +1094,12 @@ class TestSSL(functional.FunctionalTest):
                    'X-Image-Meta-Container-Format': 'ovf',
                    'X-Image-Meta-Disk-Format': 'vdi',
                    'X-Image-Meta-Size': '19',
-                   'X-Image-Meta-Id': image_id,
+                   'X-Image-Meta-Id': image['id'],
                    'X-Image-Meta-Is-Public': 'True'}
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'POST', headers=headers)
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
         self.assertEqual(response.status, 409)
-        expected = "An image with identifier %s already exists" % image_id
-        self.assertTrue(expected in content,
-                        "Could not find '%s' in '%s'" % (expected, content))
 
         self.stop_servers()
 
@@ -1202,9 +1108,9 @@ class TestSSL(functional.FunctionalTest):
         """
         We test the following:
 
-        0. GET /images
-        - Verify no public images
-        1. DELETE random image
+        0. GET /images/1
+        - Verify 404
+        1. DELETE /images/1
         - Verify 404
         """
         self.cleanup()
@@ -1215,18 +1121,123 @@ class TestSSL(functional.FunctionalTest):
 
         # 0. GET /images
         # Verify no public images
-        path = "https://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'GET')
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
         self.assertEqual(response.status, 200)
         self.assertEqual(content, '{"images": []}')
 
         # 1. DELETE /images/1
         # Verify 404 returned
-        path = "https://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
-                                               utils.generate_uuid())
-        https = httplib2.Http(disable_ssl_certificate_validation=True)
-        response, content = https.request(path, 'DELETE')
+        path = "http://%s:%d/v1/images/1" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'DELETE')
         self.assertEqual(response.status, 404)
 
         self.stop_servers()
+
+    @skip_if_disabled
+    def test_unsupported_default_store(self):
+        """
+        We test that a mis-configured default_store causes the API server
+        to fail to start.
+        """
+        self.cleanup()
+        self.default_store = 'shouldnotexist'
+
+        # ensure failure exit code is available to assert on
+        self.api_server.server_control_options += ' --await-child=1'
+
+        # ensure that the API server fails to launch
+        self.start_server(self.api_server,
+                          expect_launch=False,
+                          expected_exitcode=255,
+                          **self.__dict__.copy())
+
+    def _do_test_post_image_content_missing_format(self, format):
+        """
+        We test that missing container/disk format fails with 400 "Bad Request"
+
+        :see https://bugs.launchpad.net/glance/+bug/933702
+        """
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+
+        # POST /images without given format being specified
+        headers = minimal_headers('Image1')
+        del headers['X-Image-Meta-' + format]
+        with tempfile.NamedTemporaryFile() as test_data_file:
+            test_data_file.write("XXX")
+            test_data_file.flush()
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST',
+                            headers=headers,
+                            body=test_data_file.name)
+        self.assertEqual(response.status, 400)
+        type = format.replace('_format', '')
+        expected = "Details: Invalid %s format 'None' for image" % type
+        self.assertTrue(expected in content,
+                        "Could not find '%s' in '%s'" % (expected, content))
+
+        self.stop_servers()
+
+    @skip_if_disabled
+    def _do_test_post_image_content_missing_diskformat(self):
+        self._do_test_post_image_content_missing_format('container_format')
+
+    @skip_if_disabled
+    def _do_test_post_image_content_missing_disk_format(self):
+        self._do_test_post_image_content_missing_format('disk_format')
+
+    def _do_test_put_image_content_missing_format(self, format):
+        """
+        We test that missing container/disk format only fails with
+        400 "Bad Request" when the image content is PUT (i.e. not
+        on the original POST of a queued image).
+
+        :see https://bugs.launchpad.net/glance/+bug/937216
+        """
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        # POST queued image
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        headers = {
+           'X-Image-Meta-Name': 'Image1',
+           'X-Image-Meta-Is-Public': 'True',
+        }
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
+        self.assertEqual(response.status, 201)
+        data = json.loads(content)
+        image_id = data['image']['id']
+
+        # PUT image content images without given format being specified
+        path = ("http://%s:%d/v1/images/%s" %
+                ("0.0.0.0", self.api_port, image_id))
+        headers = minimal_headers('Image1')
+        del headers['X-Image-Meta-' + format]
+        with tempfile.NamedTemporaryFile() as test_data_file:
+            test_data_file.write("XXX")
+            test_data_file.flush()
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT',
+                            headers=headers,
+                            body=test_data_file.name)
+        self.assertEqual(response.status, 400)
+        type = format.replace('_format', '')
+        expected = "Details: Invalid %s format 'None' for image" % type
+        self.assertTrue(expected in content,
+                        "Could not find '%s' in '%s'" % (expected, content))
+
+        self.stop_servers()
+
+    @skip_if_disabled
+    def _do_test_put_image_content_missing_diskformat(self):
+        self._do_test_put_image_content_missing_format('container_format')
+
+    @skip_if_disabled
+    def _do_test_put_image_content_missing_disk_format(self):
+        self._do_test_put_image_content_missing_format('disk_format')

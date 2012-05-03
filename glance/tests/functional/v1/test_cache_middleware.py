@@ -26,52 +26,22 @@ import hashlib
 import json
 import os
 import shutil
-import thread
 import time
 
-import BaseHTTPServer
 import httplib2
 
 from glance.tests import functional
 from glance.tests.utils import (skip_if_disabled,
+                                requires,
                                 execute,
-                                xattr_writes_supported)
+                                xattr_writes_supported,
+                                minimal_headers)
 
+from glance.tests.functional.store_utils import (setup_http,
+                                                 teardown_http,
+                                                 get_http_uri)
 
 FIVE_KB = 5 * 1024
-
-
-class RemoteImageHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        """
-        Respond to an image HEAD request fake metadata
-        """
-        if 'images' in self.path:
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Content-Length', FIVE_KB)
-            self.end_headers()
-            return
-        else:
-            self.send_error(404, 'File Not Found: %s' % self.path)
-            return
-
-    def do_GET(self):
-        """
-        Respond to an image GET request with fake image content.
-        """
-        if 'images' in self.path:
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Content-Length', FIVE_KB)
-            self.end_headers()
-            image_data = '*' * FIVE_KB
-            self.wfile.write(image_data)
-            self.wfile.close()
-            return
-        else:
-            self.send_error(404, 'File Not Found: %s' % self.path)
-            return
 
 
 class BaseCacheMiddlewareTest(object):
@@ -90,9 +60,7 @@ class BaseCacheMiddlewareTest(object):
 
         # Add an image and verify a 200 OK is returned
         image_data = "*" * FIVE_KB
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': 'Image1',
-                   'X-Image-Meta-Is-Public': 'True'}
+        headers = minimal_headers('Image1')
         path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
         http = httplib2.Http()
         response, content = http.request(path, 'POST', headers=headers,
@@ -153,6 +121,7 @@ class BaseCacheMiddlewareTest(object):
 
         self.stop_servers()
 
+    @requires(setup_http, teardown_http)
     @skip_if_disabled
     def test_cache_remote_image(self):
         """
@@ -164,19 +133,11 @@ class BaseCacheMiddlewareTest(object):
         api_port = self.api_port
         registry_port = self.registry_port
 
-        # set up "remote" image server
-        server_class = BaseHTTPServer.HTTPServer
-        remote_server = server_class(('127.0.0.1', 0), RemoteImageHandler)
-        remote_ip, remote_port = remote_server.server_address
-
-        def serve_requests(httpd):
-            httpd.serve_forever()
-
-        thread.start_new_thread(serve_requests, (remote_server,))
-
         # Add a remote image and verify a 201 Created is returned
-        remote_uri = 'http://%s:%d/images/2' % (remote_ip, remote_port)
+        remote_uri = get_http_uri(self, '2')
         headers = {'X-Image-Meta-Name': 'Image2',
+                   'X-Image-Meta-disk_format': 'raw',
+                   'X-Image-Meta-container_format': 'ovf',
                    'X-Image-Meta-Is-Public': 'True',
                    'X-Image-Meta-Location': remote_uri}
         path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
@@ -202,8 +163,6 @@ class BaseCacheMiddlewareTest(object):
         self.assertEqual(response.status, 200)
         self.assertEqual(int(response['content-length']), FIVE_KB)
 
-        remote_server.shutdown()
-
         self.stop_servers()
 
 
@@ -226,9 +185,8 @@ class BaseCacheManageMiddlewareTest(object):
         identifier
         """
         image_data = "*" * FIVE_KB
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': '%s' % name,
-                   'X-Image-Meta-Is-Public': 'True'}
+        headers = minimal_headers('%s' % name)
+
         path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
         http = httplib2.Http()
         response, content = http.request(path, 'POST', headers=headers,
@@ -254,6 +212,69 @@ class BaseCacheManageMiddlewareTest(object):
         data = json.loads(content)
         self.assertTrue('cached_images' in data)
         self.assertEqual(data['cached_images'], [])
+
+    @skip_if_disabled
+    def test_user_not_authorized(self):
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+        self.verify_no_images()
+
+        image_id1 = self.add_image("Image1")
+        image_id2 = self.add_image("Image2")
+
+        # Verify image does not yet show up in cache (we haven't "hit"
+        # it yet using a GET /images/1 ...
+        self.verify_no_cached_images()
+
+        # Grab the image
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0", self.api_port,
+                                              image_id1)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+
+        # Verify image now in cache
+        path = "http://%s:%d/v1/cached_images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 200)
+
+        data = json.loads(content)
+        self.assertTrue('cached_images' in data)
+
+        cached_images = data['cached_images']
+        self.assertEqual(1, len(cached_images))
+        self.assertEqual(image_id1, cached_images[0]['image_id'])
+
+        # Set policy to disallow access to cache management
+        rules = {"manage_image_cache": [["false:false"]]}
+        self.set_policy_rules(rules)
+
+        # Verify an unprivileged user cannot see cached images
+        path = "http://%s:%d/v1/cached_images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'GET')
+        self.assertEqual(response.status, 403)
+
+        # Verify an unprivileged user cannot delete images from the cache
+        path = "http://%s:%d/v1/cached_images/%s" % ("0.0.0.0", self.api_port,
+                                                     image_id1)
+        http = httplib2.Http()
+        response, content = http.request(path, 'DELETE')
+        self.assertEqual(response.status, 403)
+
+        # Verify an unprivileged user cannot delete all cached images
+        path = "http://%s:%d/v1/cached_images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'DELETE')
+        self.assertEqual(response.status, 403)
+
+        # Verify an unprivileged user cannot queue an image
+        path = "http://%s:%d/v1/queued_images/%s" % ("0.0.0.0", self.api_port,
+                                                     image_id2)
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT')
+        self.assertEqual(response.status, 403)
 
     @skip_if_disabled
     def test_cache_manage_get_cached_images(self):

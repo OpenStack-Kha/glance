@@ -18,12 +18,47 @@
 """Functional test case that utilizes the bin/glance CLI tool"""
 
 import datetime
+import httplib2
+import json
 import os
 import tempfile
 
 from glance.common import utils
 from glance.tests import functional
-from glance.tests.utils import execute
+from glance.tests.utils import execute, requires, minimal_add_command
+from glance.tests.functional.store_utils import (setup_http,
+                                                 teardown_http,
+                                                 get_http_uri)
+
+
+class TestBinGlanceAuth(functional.FunctionalTest):
+    """Functional tests for bin/glance with some amount of auth"""
+
+    def assertIn(self, key, bag):
+        msg = 'Expected to find substring "%s" in "%s"' % (key, bag)
+        self.assertTrue(key in bag, msg)
+
+    def assertNotIn(self, key, bag):
+        msg = 'Expected not to find substring "%s" in "%s"' % (key, bag)
+        self.assertFalse(key in bag, msg)
+
+    def test_index_with_https_auth(self):
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        cmd = ("bin/glance --port=%d -N https://this.url.doesnt.matter/ "
+               "-A aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa index") % api_port
+        exitcode, out, err = execute(cmd, raise_error=False)
+
+        #NOTE(markwash): we should expect the command to fail because the
+        # testing glance api server is not configured to authenticate, and the
+        # token we provide is invalid. However, it should fail due to
+        # NotAuthenticated, rather than because of an SSL error.
+
+        self.assertNotEqual(0, exitcode)
+        self.assertNotIn('SSL23_GET_SERVER_HELLO', out)
+        self.assertIn('NotAuthenticated: You are not authenticated.', out)
 
 
 class TestBinGlance(functional.FunctionalTest):
@@ -37,6 +72,66 @@ class TestBinGlance(functional.FunctionalTest):
         # spin up won't have keystone support, so we need to switch to the
         # NoAuth strategy.
         os.environ['OS_AUTH_STRATEGY'] = 'noauth'
+
+    def _assertStartsWith(self, str, prefix):
+        msg = 'expected "%s" to start with "%s"' % (str, prefix)
+        self.assertTrue(str.startswith(prefix), msg)
+
+    def test_add_with_location_and_id(self):
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        registry_port = self.registry_port
+
+        # 0. Verify no public images
+        cmd = "bin/glance --port=%d index" % api_port
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertEqual('', out.strip())
+
+        image_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        # 1a. Add public image
+        cmd = minimal_add_command(api_port,
+                                  'MyImage',
+                                  'id=%s' % image_id,
+                                  'location=http://example.com')
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        expected = 'Added new image with ID: %s' % image_id
+        self.assertTrue(expected in out)
+
+        # 1b. Add public image with non-uuid id
+        cmd = minimal_add_command(api_port,
+                                  'MyImage',
+                                  'id=12345',
+                                  'location=http://example.com')
+        exitcode, out, err = execute(cmd, expected_exitcode=1)
+
+        self.assertEqual(1, exitcode)
+        self.assertTrue('Invalid image id format' in out)
+
+        # 2. Verify image added as public image
+        cmd = "bin/glance --port=%d index" % api_port
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        lines = out.split("\n")[2:-1]
+        self.assertEqual(1, len(lines))
+
+        line = lines[0]
+
+        image_id, name, disk_format, container_format, size = \
+            [c.strip() for c in line.split()]
+        self.assertEqual('MyImage', name)
+
+        self.assertEqual('0', size, "Expected image to be 0 bytes in size, "
+                                    "but got %s. " % size)
 
     def test_add_with_location(self):
         self.cleanup()
@@ -54,8 +149,9 @@ class TestBinGlance(functional.FunctionalTest):
         self.assertEqual('', out.strip())
 
         # 1. Add public image
-        cmd = "bin/glance --port=%d add is_public=True"\
-              " name=MyImage location=http://example.com" % api_port
+        cmd = minimal_add_command(api_port,
+                                  'MyImage',
+                                  'location=http://example.com')
         exitcode, out, err = execute(cmd)
 
         self.assertEqual(0, exitcode)
@@ -79,6 +175,252 @@ class TestBinGlance(functional.FunctionalTest):
         self.assertEqual('0', size, "Expected image to be 0 bytes in size, "
                                     "but got %s. " % size)
 
+    def _verify_owner(self, owner, image_id):
+        cmd = "bin/glance --port=%d show %s" % (self.api_port, image_id)
+        exitcode, out, err = execute(cmd)
+        self.assertEqual(0, exitcode)
+
+        # verify expected owner as first class attribute
+        self.assertTrue(('Owner: %s' % owner) in out)
+        # ensure owner does not appear as a custom property
+        self.assertFalse("Property 'owner':" in out)
+
+    def _create_by_admin(self, owner):
+        # ownership set by admin user (defaults as such due to no-auth)
+        cmd = minimal_add_command(self.api_port,
+                                  'MyImage',
+                                  '--silent-upload owner=%s' % owner)
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+
+        return out.strip().replace('Added new image with ID: ', '')
+
+    def test_add_with_owner_admin(self):
+        """Test setting ownership of new image by admin user"""
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        image_id = self._create_by_admin('42')
+
+        self._verify_owner('42', image_id)
+
+    def test_add_with_owner_non_admin(self):
+        """Test setting ownership of new image by non-admin user"""
+        self.cleanup()
+        self.api_server.deployment_flavor = 'fakeauth'
+        self.registry_server.deployment_flavor = 'fakeauth'
+        self.start_servers(**self.__dict__.copy())
+
+        # ownership set by non-admin user (setup as such by fakeauth pipeline)
+        headers = {'X-Image-Meta-Name': 'MyImage',
+                   'X-Image-Meta-disk_format': 'raw',
+                   'X-Image-Meta-container_format': 'ovf',
+                   'X-Image-Meta-Is-Public': 'True',
+                   'X-Image-Meta-Owner': '42',
+                   'X-Auth-Token': 'Confirmed:pattieblack:froggy:demo',
+        }
+
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
+        self.assertEqual(response.status, 201)
+        data = json.loads(content)
+        image_id = data['image']['id']
+
+        self._verify_owner('froggy', image_id)
+
+    def test_update_with_owner_admin(self):
+        """Test updating ownership of existing image by admin user"""
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        image_id = self._create_by_admin('user1')
+
+        self._verify_owner('user1', image_id)
+
+        # ownership updated by admin user (defaults as such due to no-auth)
+        cmd = "bin/glance update %s owner=user2 -p %d" % (image_id,
+                                                          self.api_port)
+        exitcode, out, err = execute(cmd, raise_error=False)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().endswith('Updated image %s' % image_id))
+
+        self._verify_owner('user2', image_id)
+
+    def test_update_with_owner_non_admin(self):
+        """Test updating ownership of existing image by non-admin user"""
+        self.cleanup()
+        self.api_server.deployment_flavor = 'fakeauth'
+        self.registry_server.deployment_flavor = 'fakeauth'
+        self.start_servers(**self.__dict__.copy())
+
+        image_id = self._create_by_admin('user1')
+
+        # ownership update attempted by non-admin user
+        # (setup as such by fakeauth pipeline)
+        headers = {'X-Image-Meta-Owner': 'user2',
+                   'X-Auth-Token': 'Confirmed:pattieblack:froggy:demo',
+        }
+
+        path = "http://%s:%d/v1/images/%s" % ("0.0.0.0",
+                                              self.api_port,
+                                              image_id)
+        http = httplib2.Http()
+        response, content = http.request(path, 'PUT', headers=headers)
+        self.assertEqual(response.status, 403)
+
+    def test_add_no_name(self):
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        registry_port = self.registry_port
+
+        # 0. Verify no public images
+        cmd = "bin/glance --port=%d index" % api_port
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertEqual('', out.strip())
+
+        # 1. Add public image
+        # Can't use minimal_add_command since that uses
+        # name...
+        cmd = ("bin/glance --port=%d add is_public=True"
+               " disk_format=raw container_format=ovf"
+               " %s" % (api_port, 'location=http://example.com'))
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+
+        # 2. Verify image added as public image
+        cmd = "bin/glance --port=%d index" % api_port
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        lines = out.split("\n")[2:-1]
+        self.assertEqual(1, len(lines))
+
+        line = lines[0]
+
+        image_id, name, disk_format, container_format, size = \
+            [c.strip() for c in line.split()]
+        self.assertEqual('None', name)
+
+    @requires(setup_http, teardown_http)
+    def test_add_copying_from(self):
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        registry_port = self.registry_port
+
+        # 0. Verify no public images
+        cmd = "bin/glance --port=%d index" % api_port
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertEqual('', out.strip())
+
+        # 1. Add public image
+        suffix = 'copy_from=%s' % get_http_uri(self, 'foobar')
+        cmd = minimal_add_command(api_port, 'MyImage', suffix)
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+
+        # 2. Verify image added as public image
+        cmd = "bin/glance --port=%d index" % api_port
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        lines = out.split("\n")[2:-1]
+        self.assertEqual(1, len(lines))
+
+        line = lines[0]
+
+        image_id, name, disk_format, container_format, size = \
+            [c.strip() for c in line.split()]
+        self.assertEqual('MyImage', name)
+
+        self.assertEqual('5120', size, "Expected image to be 5120 bytes "
+                                       " in size, but got %s. " % size)
+
+    def _do_test_update_external_source(self, source):
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        registry_port = self.registry_port
+
+        # 1. Add public image with no image content
+        headers = {'X-Image-Meta-Name': 'MyImage',
+                   'X-Image-Meta-disk_format': 'raw',
+                   'X-Image-Meta-container_format': 'ovf',
+                   'X-Image-Meta-Is-Public': 'True'}
+        path = "http://%s:%d/v1/images" % ("0.0.0.0", api_port)
+        http = httplib2.Http()
+        response, content = http.request(path, 'POST', headers=headers)
+        self.assertEqual(response.status, 201)
+        data = json.loads(content)
+        self.assertEqual(data['image']['name'], 'MyImage')
+        image_id = data['image']['id']
+
+        # 2. Update image with external source
+        source = '%s=%s' % (source, get_http_uri(self, 'foobar'))
+        cmd = "bin/glance update %s %s -p %d" % (image_id, source, api_port)
+        exitcode, out, err = execute(cmd, raise_error=False)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().endswith('Updated image %s' % image_id))
+
+        # 3. Verify image is now active and of the correct size
+        cmd = "bin/glance --port=%d show %s" % (api_port, image_id)
+
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+
+        expected_lines = [
+            'URI: http://0.0.0.0:%s/v1/images/%s' % (api_port, image_id),
+            'Id: %s' % image_id,
+            'Public: Yes',
+            'Name: MyImage',
+            'Status: active',
+            'Size: 5120',
+            'Disk format: raw',
+            'Container format: ovf',
+            'Minimum Ram Required (MB): 0',
+            'Minimum Disk Required (GB): 0',
+        ]
+        lines = out.split("\n")
+        self.assertTrue(set(lines) >= set(expected_lines))
+
+    @requires(setup_http, teardown_http)
+    def test_update_copying_from(self):
+        """
+        Tests creating an queued image then subsequently updating
+        with a copy-from source
+        """
+        self._do_test_update_external_source('copy_from')
+
+    @requires(setup_http, teardown_http)
+    def test_update_location(self):
+        """
+        Tests creating an queued image then subsequently updating
+        with a location source
+        """
+        self._do_test_update_external_source('location')
+
     def test_add_with_location_and_stdin(self):
         self.cleanup()
         self.start_servers(**self.__dict__.copy())
@@ -99,8 +441,10 @@ class TestBinGlance(functional.FunctionalTest):
             image_file.write("XXX")
             image_file.flush()
             file_name = image_file.name
-            cmd = "bin/glance --port=%d add is_public=True name=MyImage " \
-                  "location=http://example.com < %s" % (api_port, file_name)
+            cmd = minimal_add_command(api_port,
+                                     'MyImage',
+                                     'location=http://example.com < %s' %
+                                     file_name)
             exitcode, out, err = execute(cmd)
 
         self.assertEqual(0, exitcode)
@@ -153,13 +497,15 @@ class TestBinGlance(functional.FunctionalTest):
             image_file.write("XXX")
             image_file.flush()
             image_file_name = image_file.name
-            cmd = "bin/glance --port=%d add is_public=True"\
-                  " name=MyImage < %s" % (api_port, image_file_name)
+            suffix = '--silent-upload < %s' % image_file_name
+            cmd = minimal_add_command(api_port, 'MyImage', suffix)
 
             exitcode, out, err = execute(cmd)
 
         self.assertEqual(0, exitcode)
-        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+        msg = out.split("\n")
+
+        self._assertStartsWith(msg[0], 'Added new image with ID:')
 
         # 2. Verify image added as public image
         cmd = "bin/glance --port=%d index" % api_port
@@ -227,12 +573,16 @@ class TestBinGlance(functional.FunctionalTest):
         self.assertEqual('', out.strip())
 
         # 1. Add public image
-        cmd = "bin/glance --port=%d add name=MyImage" % api_port
+        cmd = minimal_add_command(api_port,
+                                  'MyImage',
+                                  'location=http://example.com',
+                                  public=False)
 
         exitcode, out, err = execute(cmd)
 
         self.assertEqual(0, exitcode)
-        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+        msg = out.split('\n')
+        self.assertTrue(msg[0].startswith('Added new image with ID:'))
 
         image_id = out.strip().split(':')[1].strip()
 
@@ -338,6 +688,70 @@ class TestBinGlance(functional.FunctionalTest):
         self.stop_servers()
 
     @functional.runs_sql
+    def test_add_location_with_checksum(self):
+        """
+        We test the following:
+
+            1. Add an image with location and checksum
+            2. Run SQL against DB to verify checksum was entered correctly
+        """
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        registry_port = self.registry_port
+
+        # 1. Add public image
+        cmd = minimal_add_command(api_port,
+                                 'MyImage',
+                                 'location=http://example.com checksum=1')
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+
+        image_id = out.split(":")[1].strip()
+
+        sql = 'SELECT checksum FROM images WHERE id = "%s"' % image_id
+        recs = self.run_sql_cmd(sql)
+
+        self.assertEqual('1', recs.first()[0])
+
+        self.stop_servers()
+
+    @functional.runs_sql
+    def test_add_location_without_checksum(self):
+        """
+        We test the following:
+
+            1. Add an image with location and no checksum
+            2. Run SQL against DB to verify checksum is NULL
+        """
+        self.cleanup()
+        self.start_servers(**self.__dict__.copy())
+
+        api_port = self.api_port
+        registry_port = self.registry_port
+
+        # 1. Add public image
+        cmd = minimal_add_command(api_port,
+                                 'MyImage',
+                                 'location=http://example.com')
+        exitcode, out, err = execute(cmd)
+
+        self.assertEqual(0, exitcode)
+        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+
+        image_id = out.split(":")[1].strip()
+
+        sql = 'SELECT checksum FROM images WHERE id = "%s"' % image_id
+        recs = self.run_sql_cmd(sql)
+
+        self.assertEqual(None, recs.first()[0])
+
+        self.stop_servers()
+
+    @functional.runs_sql
     def test_add_clear(self):
         """
         We test the following:
@@ -355,8 +769,9 @@ class TestBinGlance(functional.FunctionalTest):
 
         # 1. Add some images
         for i in range(1, 5):
-            cmd = "bin/glance --port=%d add is_public=True name=MyName " \
-                  " foo=bar" % api_port
+            cmd = minimal_add_command(api_port,
+                                      'MyImage',
+                                      'foo=bar')
             exitcode, out, err = execute(cmd)
 
             self.assertEqual(0, exitcode)
@@ -704,8 +1119,8 @@ class TestBinGlance(functional.FunctionalTest):
             image_file.write("XXX")
             image_file.flush()
             image_file_name = image_file.name
-            cmd = "bin/glance --port=%d add is_public=True"\
-                  " name=MyImage < %s" % (api_port, image_file_name)
+            suffix = ' --silent-upload < %s' % image_file_name
+            cmd = minimal_add_command(api_port, 'MyImage', suffix)
 
             exitcode, out, err = execute(cmd)
 
@@ -771,13 +1186,16 @@ class TestBinGlance(functional.FunctionalTest):
         self.assertEqual('', out.strip())
 
         # 1. Add public image
-        cmd = "echo testdata | bin/glance --port=%d add is_public=True"\
-              " protected=True name=MyImage" % api_port
+        cmd = ("echo testdata | " +
+               minimal_add_command(api_port,
+                                   'MyImage',
+                                   'protected=True'))
 
         exitcode, out, err = execute(cmd)
 
         self.assertEqual(0, exitcode)
-        self.assertTrue(out.strip().startswith('Added new image with ID:'))
+        msg = out.split("\n")
+        self.assertTrue(msg[3].startswith('Added new image with ID:'))
 
         # 2. Verify image added as public image
         cmd = "bin/glance --port=%d index" % api_port
@@ -800,7 +1218,7 @@ class TestBinGlance(functional.FunctionalTest):
         exitcode, out, err = execute(cmd, raise_error=False)
 
         self.assertNotEqual(0, exitcode)
-        self.assertTrue('Image is protected' in err)
+        self.assertTrue(out.startswith('You do not have permission'))
 
         # 4. Remove image protection
         cmd = "bin/glance --port=%d --force update %s" \

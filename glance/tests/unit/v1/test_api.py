@@ -24,6 +24,7 @@ import unittest
 import stubout
 import webob
 
+from sqlalchemy import exc
 from glance.api.v1 import images
 from glance.api.v1 import router
 from glance.common import context
@@ -47,6 +48,7 @@ class TestRegistryDb(unittest.TestCase):
     def setUp(self):
         """Establish a clean test environment"""
         self.stubs = stubout.StubOutForTesting()
+        self.orig_engine = db_api._ENGINE
 
     def test_bad_sql_connection(self):
         """
@@ -61,9 +63,9 @@ class TestRegistryDb(unittest.TestCase):
                 })
         # We set this to None to trigger a reconfigure, otherwise
         # other modules may have already correctly configured the DB
-        orig_engine = db_api._ENGINE
         db_api._ENGINE = None
-        self.assertRaises(ImportError, db_api.configure_db, bad_conf)
+        self.assertRaises((ImportError, exc.ArgumentError),
+            db_api.configure_db, bad_conf)
         exc_raised = False
         self.log_written = False
 
@@ -74,16 +76,17 @@ class TestRegistryDb(unittest.TestCase):
         self.stubs.Set(db_api.logger, 'error', fake_log_error)
         try:
             api_obj = rserver.API(bad_conf)
+        except exc.ArgumentError:
+            exc_raised = True
         except ImportError:
             exc_raised = True
-        finally:
-            db_api._ENGINE = orig_engine
 
         self.assertTrue(exc_raised)
         self.assertTrue(self.log_written)
 
     def tearDown(self):
         """Clear the test environment"""
+        db_api._ENGINE = self.orig_engine
         self.stubs.UnsetAll()
 
 
@@ -1265,8 +1268,9 @@ class TestRegistryAPI(base.IsolatedUnitTest):
         dt2 = datetime.datetime.utcnow() + datetime.timedelta(1)
         iso2 = utils.isotime(dt2)
 
-        dt3 = datetime.datetime.utcnow() + datetime.timedelta(2)
-        iso3 = utils.isotime(dt3)
+        image_ts = datetime.datetime.utcnow() + datetime.timedelta(2)
+        hour_before = image_ts.strftime('%Y-%m-%dT%H:%M:%S%%2B01:00')
+        hour_after = image_ts.strftime('%Y-%m-%dT%H:%M:%S-01:00')
 
         dt4 = datetime.datetime.utcnow() + datetime.timedelta(3)
         iso4 = utils.isotime(dt4)
@@ -1293,8 +1297,8 @@ class TestRegistryAPI(base.IsolatedUnitTest):
                          'name': 'fake image #4',
                          'size': 20,
                          'checksum': None,
-                         'created_at': dt3,
-                         'updated_at': dt3}
+                         'created_at': image_ts,
+                         'updated_at': image_ts}
 
         db_api.image_create(self.context, extra_fixture)
 
@@ -1327,6 +1331,25 @@ class TestRegistryAPI(base.IsolatedUnitTest):
         images = res_dict['images']
         self.assertEquals(len(images), 1)
         self.assertEqual(images[0]['id'], UUID4)
+
+        # Expect 1 images (0 deleted)
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+                                  hour_before)
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 200)
+        res_dict = json.loads(res.body)
+        images = res_dict['images']
+        self.assertEquals(len(images), 1)
+        self.assertEqual(images[0]['id'], UUID4)
+
+        # Expect 0 images (0 deleted)
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+                                  hour_after)
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 200)
+        res_dict = json.loads(res.body)
+        images = res_dict['images']
+        self.assertEquals(len(images), 0)
 
         # Expect 0 images (0 deleted)
         req = webob.Request.blank('/images/detail?changes-since=%s' % iso4)
@@ -1989,6 +2012,28 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         db_models.unregister_models(db_api._ENGINE)
         db_models.register_models(db_api._ENGINE)
 
+    def _do_test_defaulted_format(self, format_key, format_value):
+        fixture_headers = {'x-image-meta-name': 'defaulted',
+                           'x-image-meta-location': 'http://foo.com/image',
+                           format_key: format_value}
+
+        req = webob.Request.blank("/images")
+        req.method = 'POST'
+        for k, v in fixture_headers.iteritems():
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 201)
+        res_body = json.loads(res.body)['image']
+        self.assertEquals(format_value, res_body['disk_format'])
+        self.assertEquals(format_value, res_body['container_format'])
+
+    def test_defaulted_amazon_format(self):
+        for key in ('x-image-meta-disk-format',
+                    'x-image-meta-container-format'):
+            for value in ('aki', 'ari', 'ami'):
+                self._do_test_defaulted_format(key, value)
+
     def test_bad_disk_format(self):
         fixture_headers = {'x-image-meta-store': 'bad',
                    'x-image-meta-name': 'bogus',
@@ -2066,7 +2111,9 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEquals(res.status_int, httplib.OK)
 
         res_body = json.loads(res.body)['image']
-        self.assertEquals('queued', res_body['status'])
+        # Once the location is set, the image should be activated
+        # see LP Bug #939484
+        self.assertEquals('active', res_body['status'])
         self.assertFalse('location' in res_body)  # location never shown
 
     def test_add_image_no_location_no_content_type(self):
@@ -2169,7 +2216,94 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         req.headers['Content-Type'] = 'application/octet-stream'
         req.body = "chunk00000remainder"
         res = req.get_response(self.api)
-        self.assertEquals(res.status_int, 401)
+        self.assertEquals(res.status_int, 403)
+
+    def test_add_public_image_unauthorized(self):
+        rules = {"add_image": [], "publicize_image": [["false:false"]]}
+        self.set_policy_rules(rules)
+        fixture_headers = {'x-image-meta-store': 'file',
+                           'x-image-meta-is-public': 'true',
+                           'x-image-meta-disk-format': 'vhd',
+                           'x-image-meta-container-format': 'ovf',
+                           'x-image-meta-name': 'fake image #3'}
+
+        req = webob.Request.blank("/images")
+        req.method = 'POST'
+        for k, v in fixture_headers.iteritems():
+            req.headers[k] = v
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+        req.body = "chunk00000remainder"
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 403)
+
+    def _do_test_post_image_content_missing_format(self, missing):
+        """Tests creation of an image with missing format"""
+        fixture_headers = {'x-image-meta-store': 'file',
+                           'x-image-meta-disk-format': 'vhd',
+                           'x-image-meta-container-format': 'ovf',
+                           'x-image-meta-name': 'fake image #3'}
+
+        header = 'x-image-meta-' + missing.replace('_', '-')
+
+        del fixture_headers[header]
+
+        req = webob.Request.blank("/images")
+        req.method = 'POST'
+        for k, v in fixture_headers.iteritems():
+            req.headers[k] = v
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+        req.body = "chunk00000remainder"
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, httplib.BAD_REQUEST)
+
+    def test_post_image_content_missing_disk_format(self):
+        """Tests creation of an image with missing disk format"""
+        self._do_test_post_image_content_missing_format('disk_format')
+
+    def test_post_image_content_missing_container_type(self):
+        """Tests creation of an image with missing container format"""
+        self._do_test_post_image_content_missing_format('container_format')
+
+    def _do_test_put_image_content_missing_format(self, missing):
+        """Tests delayed activation of an image with missing format"""
+        fixture_headers = {'x-image-meta-store': 'file',
+                           'x-image-meta-disk-format': 'vhd',
+                           'x-image-meta-container-format': 'ovf',
+                           'x-image-meta-name': 'fake image #3'}
+
+        header = 'x-image-meta-' + missing.replace('_', '-')
+
+        del fixture_headers[header]
+
+        req = webob.Request.blank("/images")
+        req.method = 'POST'
+        for k, v in fixture_headers.iteritems():
+            req.headers[k] = v
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+        res_body = json.loads(res.body)['image']
+        self.assertEquals('queued', res_body['status'])
+        image_id = res_body['id']
+
+        req = webob.Request.blank("/images/%s" % image_id)
+        req.method = 'PUT'
+        for k, v in fixture_headers.iteritems():
+            req.headers[k] = v
+        req.headers['Content-Type'] = 'application/octet-stream'
+        req.body = "chunk00000remainder"
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, httplib.BAD_REQUEST)
+
+    def test_put_image_content_missing_disk_format(self):
+        """Tests delayed activation of image with missing disk format"""
+        self._do_test_put_image_content_missing_format('disk_format')
+
+    def test_put_image_content_missing_container_type(self):
+        """Tests delayed activation of image with missing container format"""
+        self._do_test_put_image_content_missing_format('container_format')
 
     def test_register_and_upload(self):
         """
@@ -2312,6 +2446,31 @@ class TestGlanceAPI(base.IsolatedUnitTest):
                         "Did not find required property in headers. "
                         "Got headers: %r" % res.headers)
 
+    def test_publicize_image_unauthorized(self):
+        """Create a non-public image then fail to make public"""
+        rules = {"add_image": [], "publicize_image": [["false:false"]]}
+        self.set_policy_rules(rules)
+
+        fixture_headers = {'x-image-meta-store': 'file',
+                           'x-image-meta-disk-format': 'vhd',
+                           'x-image-meta-is-public': 'false',
+                           'x-image-meta-container-format': 'ovf',
+                           'x-image-meta-name': 'fake image #3'}
+
+        req = webob.Request.blank("/images")
+        req.method = 'POST'
+        for k, v in fixture_headers.iteritems():
+            req.headers[k] = v
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+        res_body = json.loads(res.body)['image']
+        req = webob.Request.blank("/images/%s" % res_body['id'])
+        req.method = 'PUT'
+        req.headers['x-image-meta-is-public'] = 'true'
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 403)
+
     def test_get_index_sort_name_asc(self):
         """
         Tests that the /images registry API returns list of
@@ -2364,8 +2523,9 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         dt2 = datetime.datetime.utcnow() + datetime.timedelta(1)
         iso2 = utils.isotime(dt2)
 
-        dt3 = datetime.datetime.utcnow() + datetime.timedelta(2)
-        iso3 = utils.isotime(dt3)
+        image_ts = datetime.datetime.utcnow() + datetime.timedelta(2)
+        hour_before = image_ts.strftime('%Y-%m-%dT%H:%M:%S%%2B01:00')
+        hour_after = image_ts.strftime('%Y-%m-%dT%H:%M:%S-01:00')
 
         dt4 = datetime.datetime.utcnow() + datetime.timedelta(3)
         iso4 = utils.isotime(dt4)
@@ -2392,8 +2552,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
                          'name': 'fake image #4',
                          'size': 20,
                          'checksum': None,
-                         'created_at': dt3,
-                         'updated_at': dt3}
+                         'created_at': image_ts,
+                         'updated_at': image_ts}
 
         db_api.image_create(self.context, extra_fixture)
 
@@ -2427,6 +2587,25 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.assertEquals(len(images), 1)
         self.assertEqual(images[0]['id'], UUID4)
 
+        # Expect 1 images (0 deleted)
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+                                  hour_before)
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 200)
+        res_dict = json.loads(res.body)
+        images = res_dict['images']
+        self.assertEquals(len(images), 1)
+        self.assertEqual(images[0]['id'], UUID4)
+
+        # Expect 0 images (0 deleted)
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+                                  hour_after)
+        res = req.get_response(self.api)
+        self.assertEquals(res.status_int, 200)
+        res_dict = json.loads(res.body)
+        images = res_dict['images']
+        self.assertEquals(len(images), 0)
+
         # Expect 0 images (0 deleted)
         req = webob.Request.blank('/images/detail?changes-since=%s' % iso4)
         res = req.get_response(self.api)
@@ -2450,14 +2629,14 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.set_policy_rules(rules)
         req = webob.Request.blank('/images/detail')
         res = req.get_response(self.api)
-        self.assertEquals(res.status_int, 401)
+        self.assertEquals(res.status_int, 403)
 
     def test_get_images_unauthorized(self):
         rules = {"get_images": [["false:false"]]}
         self.set_policy_rules(rules)
         req = webob.Request.blank('/images/detail')
         res = req.get_response(self.api)
-        self.assertEquals(res.status_int, 401)
+        self.assertEquals(res.status_int, 403)
 
     def test_store_location_not_revealed(self):
         """
@@ -2619,7 +2798,7 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         req = webob.Request.blank("/images/%s" % UUID2)
         req.method = 'HEAD'
         res = req.get_response(self.api)
-        self.assertEquals(res.status_int, 401)
+        self.assertEquals(res.status_int, 403)
 
     def test_show_image_basic(self):
         req = webob.Request.blank("/images/%s" % UUID2)
@@ -2638,7 +2817,7 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         self.set_policy_rules(rules)
         req = webob.Request.blank("/images/%s" % UUID2)
         res = req.get_response(self.api)
-        self.assertEqual(res.status_int, 401)
+        self.assertEqual(res.status_int, 403)
 
     def test_delete_image(self):
         req = webob.Request.blank("/images/%s" % UUID2)
@@ -2671,6 +2850,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         # We will stop the process after the reservation stage, then
         # try to delete the image.
         fixture_headers = {'x-image-meta-store': 'file',
+                           'x-image-meta-disk-format': 'vhd',
+                           'x-image-meta-container-format': 'ovf',
                            'x-image-meta-name': 'fake image #3'}
 
         req = webob.Request.blank("/images")
@@ -2692,6 +2873,8 @@ class TestGlanceAPI(base.IsolatedUnitTest):
     def test_delete_protected_image(self):
         fixture_headers = {'x-image-meta-store': 'file',
                            'x-image-meta-name': 'fake image #3',
+                           'x-image-meta-disk-format': 'vhd',
+                           'x-image-meta-container-format': 'ovf',
                            'x-image-meta-protected': 'True'}
 
         req = webob.Request.blank("/images")
@@ -2716,7 +2899,7 @@ class TestGlanceAPI(base.IsolatedUnitTest):
         req = webob.Request.blank("/images/%s" % UUID2)
         req.method = 'DELETE'
         res = req.get_response(self.api)
-        self.assertEquals(res.status_int, 401)
+        self.assertEquals(res.status_int, 403)
 
     def test_get_details_invalid_marker(self):
         """
@@ -2938,3 +3121,44 @@ class TestImageSerializer(base.IsolatedUnitTest):
         self.serializer.image_send_notification(17, 19, image_meta, req)
 
         self.assertTrue(called['notified'])
+
+
+class TestContextMiddleware(base.IsolatedUnitTest):
+    def _build_request(self, roles=None):
+        req = webob.Request.blank('/')
+        req.headers['x-auth-token'] = 'token1'
+        req.headers['x-identity-status'] = 'Confirmed'
+        req.headers['x-user-id'] = 'user1'
+        req.headers['x-tenant-id'] = 'tenant1'
+        _roles = roles or ['role1', 'role2']
+        req.headers['x-roles'] = ','.join(_roles)
+        return req
+
+    def _build_middleware(self, **extra_config):
+        for k, v in extra_config.items():
+            setattr(self.conf, k, v)
+        return context.ContextMiddleware(None, self.conf)
+
+    def test_header_parsing(self):
+        req = self._build_request()
+        self._build_middleware().process_request(req)
+        self.assertEqual(req.context.auth_tok, 'token1')
+        self.assertEqual(req.context.user, 'user1')
+        self.assertEqual(req.context.tenant, 'tenant1')
+        self.assertEqual(req.context.roles, ['role1', 'role2'])
+
+    def test_is_admin_flag(self):
+        # is_admin check should look for 'admin' role by default
+        req = self._build_request(roles=['admin', 'role2'])
+        self._build_middleware().process_request(req)
+        self.assertTrue(req.context.is_admin)
+
+        # without the 'admin' role, is_admin shoud be False
+        req = self._build_request()
+        self._build_middleware().process_request(req)
+        self.assertFalse(req.context.is_admin)
+
+        # if we change the admin_role attribute, we should be able to use it
+        req = self._build_request()
+        self._build_middleware(admin_role='role1').process_request(req)
+        self.assertTrue(req.context.is_admin)

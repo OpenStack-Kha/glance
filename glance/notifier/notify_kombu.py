@@ -175,7 +175,8 @@ class RabbitStrategy(strategy.Strategy):
 
     def _send_message(self, msg, routing_key):
         """Send a message.  Caller needs to catch exceptions for retry."""
-        msg = self.exchange.Message(json.dumps(message))
+        msg = self.exchange.Message(json.dumps(msg),
+                                    content_type='application/json')
         self.exchange.publish(msg, routing_key=routing_key)
 
     def _notify(self, msg, priority):

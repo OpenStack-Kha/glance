@@ -20,11 +20,15 @@ Client classes for callers of a Glance system
 """
 
 import errno
+import httplib
 import json
 import logging
 import os
+import socket
+import sys
 
 import glance.api.v1
+from glance.common import animation
 from glance.common import client as base_client
 from glance.common import exception
 from glance.common import utils
@@ -126,7 +130,7 @@ class V1Client(base_client.BaseClient):
                 else:
                     raise
 
-    def add_image(self, image_meta=None, image_data=None):
+    def add_image(self, image_meta=None, image_data=None, features=None):
         """
         Tells Glance about an image's metadata as well
         as optionally the image_data itself
@@ -136,6 +140,7 @@ class V1Client(base_client.BaseClient):
         :param image_data: Optional string of raw image data
                            or file-like object that can be
                            used to read the image data
+        :param features:   Optional map of features
 
         :retval The newly-stored image's metadata.
         """
@@ -151,13 +156,24 @@ class V1Client(base_client.BaseClient):
         else:
             body = None
 
+        utils.add_features_to_http_headers(features, headers)
+
         res = self.do_request("POST", "/images", body, headers)
         data = json.loads(res.read())
         return data['image']
 
-    def update_image(self, image_id, image_meta=None, image_data=None):
+    def update_image(self, image_id, image_meta=None, image_data=None,
+                     features=None):
         """
         Updates Glance's information about an image
+
+        :param image_id:   Required image ID
+        :param image_meta: Optional Mapping of information about the
+                           image
+        :param image_data: Optional string of raw image data
+                           or file-like object that can be
+                           used to read the image data
+        :param features:   Optional map of features
         """
         if image_meta is None:
             image_meta = {}
@@ -173,6 +189,8 @@ class V1Client(base_client.BaseClient):
                 headers['content-length'] = image_size
         else:
             body = None
+
+        utils.add_features_to_http_headers(features, headers)
 
         res = self.do_request("PUT", "/images/%s" % image_id, body, headers)
         data = json.loads(res.read())
@@ -329,4 +347,100 @@ class V1Client(base_client.BaseClient):
         return True
 
 
+class ProgressIteratorWrapper(object):
+
+    def __init__(self, wrapped, transfer_info):
+        self.wrapped = wrapped
+        self.transfer_info = transfer_info
+        self.prev_len = 0L
+
+    def __iter__(self):
+        for chunk in self.wrapped:
+            if self.prev_len:
+                self.transfer_info['so_far'] += self.prev_len
+            self.prev_len = len(chunk)
+            yield chunk
+            # report final chunk
+        self.transfer_info['so_far'] += self.prev_len
+
+
+class ProgressClient(V1Client):
+
+    """
+    Specialized class that adds progress bar output/interaction into the
+    TTY of the calling client
+    """
+    def image_iterator(self, connection, headers, body):
+        wrapped = super(ProgressClient, self).image_iterator(connection,
+                                                                headers,
+                                                                body)
+        try:
+            # spawn the animation thread if the connection is good
+            connection.connect()
+            return ProgressIteratorWrapper(wrapped,
+                                        self.start_animation(headers))
+        except (httplib.HTTPResponse, socket.error):
+            # the connection is out, just "pass"
+            # and let the "glance add" fail with [Errno 111] Connection refused
+            pass
+
+    def start_animation(self, headers):
+        transfer_info = {
+            'so_far': 0L,
+            'size': headers.get('x-image-meta-size', 0L)
+        }
+        pg = animation.UploadProgressStatus(transfer_info)
+        if transfer_info['size'] == 0L:
+            sys.stdout.write("The progressbar doesn't show-up because "
+                            "the headers[x-meta-size] is zero or missing\n")
+        sys.stdout.write("Uploading image '%s'\n" %
+                        headers.get('x-image-meta-name', ''))
+        pg.start()
+        return transfer_info
+
 Client = V1Client
+
+
+def get_client(host, port=None, use_ssl=False, username=None,
+               password=None, tenant=None,
+               auth_url=None, auth_strategy=None,
+               auth_token=None, region=None,
+               is_silent_upload=False, insecure=False):
+    """
+    Returns a new client Glance client object based on common kwargs.
+    If an option isn't specified falls back to common environment variable
+    defaults.
+    """
+
+    if auth_url or os.getenv('OS_AUTH_URL'):
+        force_strategy = 'keystone'
+    else:
+        force_strategy = None
+
+    creds = dict(username=username or
+                         os.getenv('OS_AUTH_USER', os.getenv('OS_USERNAME')),
+                 password=password or
+                         os.getenv('OS_AUTH_KEY', os.getenv('OS_PASSWORD')),
+                 tenant=tenant or
+                         os.getenv('OS_AUTH_TENANT',
+                                 os.getenv('OS_TENANT_NAME')),
+                 auth_url=auth_url or os.getenv('OS_AUTH_URL'),
+                 strategy=force_strategy or auth_strategy or
+                          os.getenv('OS_AUTH_STRATEGY', 'noauth'),
+                 region=region or os.getenv('OS_REGION_NAME'),
+    )
+
+    if creds['strategy'] == 'keystone' and not creds['auth_url']:
+        msg = ("--os_auth_url option or OS_AUTH_URL environment variable "
+               "required when keystone authentication strategy is enabled\n")
+        raise exception.ClientConfigurationError(msg)
+
+    client = (ProgressClient if not is_silent_upload else Client)
+
+    return client(host=host,
+                port=port,
+                use_ssl=use_ssl,
+                auth_tok=auth_token or
+                os.getenv('OS_TOKEN'),
+                creds=creds,
+                insecure=insecure)

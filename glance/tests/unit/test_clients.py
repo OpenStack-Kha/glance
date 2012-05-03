@@ -16,25 +16,17 @@
 #    under the License.
 
 import datetime
-import json
 import os
-import StringIO
 import tempfile
 import unittest
 
-import stubout
-import webob
-
 from glance import client
-from glance.common import context
 from glance.common import exception
 from glance.common import utils
 from glance.registry.db import api as db_api
 from glance.registry.db import models as db_models
 from glance.registry import client as rclient
 from glance.registry import context as rcontext
-from glance.tests import stubs
-from glance.tests import utils as test_utils
 from glance.tests.unit import base
 
 CONF = {'sql_connection': 'sqlite://'}
@@ -1061,6 +1053,57 @@ class TestRegistryClient(base.IsolatedUnitTest):
                           self.client.add_image,
                           fixture)
 
+    def test_add_image_with_acceptably_long_name(self):
+        """Tests adding image with acceptably long name"""
+        name = 'x' * 255
+        fixture = {'name': name,
+                   'is_public': True,
+                   'disk_format': 'vmdk',
+                   'container_format': 'ovf',
+                   'size': 19,
+                   'location': "file:///tmp/glance-tests/2",
+                  }
+
+        new_image = self.client.add_image(fixture)
+
+        data = self.client.get_image(new_image['id'])
+        self.assertEquals(name, data['name'])
+
+    def test_add_image_with_excessively_long_name(self):
+        """Tests adding image with excessively long name"""
+        name = 'x' * 256
+        fixture = {'name': name,
+                   'is_public': True,
+                   'disk_format': 'vmdk',
+                   'container_format': 'ovf',
+                   'size': 19,
+                   'location': "file:///tmp/glance-tests/2",
+                  }
+
+        self.assertRaises(exception.Invalid,
+                          self.client.add_image,
+                          fixture)
+
+    def test_update_image_with_acceptably_long_name(self):
+        """Tests updating image with acceptably long name"""
+        name = 'x' * 255
+        fixture = {'name': name}
+
+        self.assertTrue(self.client.update_image(UUID2, fixture))
+
+        data = self.client.get_image(UUID2)
+        self.assertEquals(name, data['name'])
+
+    def test_update_image_with_excessively_long_name(self):
+        """Tests updating image with excessively long name"""
+        name = 'x' * 256
+        fixture = {'name': name}
+
+        self.assertRaises(exception.Invalid,
+                          self.client.update_image,
+                          UUID2,
+                          fixture)
+
     def test_update_image(self):
         """Tests that the /images PUT registry API updates the image"""
         fixture = {'name': 'fake public image #2',
@@ -1127,18 +1170,18 @@ class TestRegistryClient(base.IsolatedUnitTest):
 
     def test_replace_members(self):
         """Tests replacing image members"""
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.NotAuthenticated,
                           self.client.replace_members, UUID2,
                           dict(member_id='pattieblack'))
 
     def test_add_member(self):
         """Tests adding image members"""
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.NotAuthenticated,
                           self.client.add_member, UUID2, 'pattieblack')
 
     def test_delete_member(self):
         """Tests deleting image members"""
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.NotAuthenticated,
                           self.client.delete_member, UUID2, 'pattieblack')
 
 
@@ -1616,7 +1659,7 @@ class TestClient(base.IsolatedUnitTest):
                    'container_format': 'bare',
                    'status': 'active',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/3",
+                   'location': "http://localhost/glance-tests/3",
                    'properties': {}}
 
         new_image = self.client.add_image(fixture)
@@ -1653,7 +1696,7 @@ class TestClient(base.IsolatedUnitTest):
                    'disk_format': 'vhd',
                    'container_format': 'ovf',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/2",
+                   'location': "http://localhost/glance-tests/2",
                   }
         new_image = self.client.add_image(fixture)
         new_image_id = new_image['id']
@@ -1676,7 +1719,7 @@ class TestClient(base.IsolatedUnitTest):
                    'disk_format': 'vhd',
                    'container_format': 'ovf',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/2",
+                   'location': "http://localhost/glance-tests/2",
                    'properties': {'distro': 'Ubuntu 10.04 LTS'},
                   }
         new_image = self.client.add_image(fixture)
@@ -1700,7 +1743,7 @@ class TestClient(base.IsolatedUnitTest):
                    'disk_format': 'iso',
                    'container_format': 'bare',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/2",
+                   'location': "http://localhost/glance-tests/2",
                    'properties': {'install': 'Bindows Heaven'},
                   }
         new_image = self.client.add_image(fixture)
@@ -1728,7 +1771,7 @@ class TestClient(base.IsolatedUnitTest):
                    'disk_format': 'iso',
                    'container_format': 'vhd',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/3",
+                   'location': "http://localhost/glance-tests/3",
                    'properties': {'install': 'Bindows Heaven'},
                   }
 
@@ -1745,7 +1788,7 @@ class TestClient(base.IsolatedUnitTest):
                    'container_format': 'ovf',
                    'status': 'bad status',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/2",
+                   'location': "http://localhost/glance-tests/2",
                   }
 
         self.assertRaises(exception.Duplicate,
@@ -1760,7 +1803,7 @@ class TestClient(base.IsolatedUnitTest):
                    'container_format': 'ovf',
                    'status': 'bad status',
                    'size': 19,
-                   'location': "file:///tmp/glance-tests/2",
+                   'location': "http://localhost/glance-tests/2",
                   }
 
         new_image = self.client.add_image(fixture)
@@ -1837,7 +1880,7 @@ class TestClient(base.IsolatedUnitTest):
                    'properties': {'distro': 'Ubuntu 10.04 LTS'},
                   }
 
-        class Zeros:
+        class Zeros(object):
             def __init__(self, chunks):
                 self.chunks = chunks
                 self.zeros = open('/dev/zero', 'rb')
@@ -1991,18 +2034,18 @@ class TestClient(base.IsolatedUnitTest):
 
     def test_replace_members(self):
         """Tests replacing image members"""
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.NotAuthenticated,
                           self.client.replace_members, UUID2,
                           dict(member_id='pattieblack'))
 
     def test_add_member(self):
         """Tests adding image members"""
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.NotAuthenticated,
                           self.client.add_member, UUID2, 'pattieblack')
 
     def test_delete_member(self):
         """Tests deleting image members"""
-        self.assertRaises(exception.NotAuthorized,
+        self.assertRaises(exception.NotAuthenticated,
                           self.client.delete_member, UUID2, 'pattieblack')
 
 

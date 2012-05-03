@@ -29,6 +29,7 @@ import nose.plugins.skip
 
 from glance.common import config
 from glance.common import utils
+from glance.common import wsgi
 
 
 def get_isolated_test_env():
@@ -68,12 +69,14 @@ class TestConfigOpts(config.GlanceConfigOpts):
                         DEFAULT group
     :param groups:      nested dictionary of key-value pairs for
                         non-default groups
+    :param clean:       flag to trigger clean up of temporary directory
     """
 
-    def __init__(self, test_values={}, groups={}):
+    def __init__(self, test_values={}, groups={}, clean=True):
         super(TestConfigOpts, self).__init__()
         self._test_values = test_values
         self._test_groups = groups
+        self.clean = clean
 
         self.temp_file = os.path.join(tempfile.mkdtemp(), 'testcfg.conf')
 
@@ -85,7 +88,9 @@ class TestConfigOpts(config.GlanceConfigOpts):
             super(TestConfigOpts, self).\
                 __call__(['--config-file', self.temp_file])
         finally:
-            os.remove(self.temp_file)
+            if self.clean:
+                os.remove(self.temp_file)
+                os.rmdir(os.path.dirname(self.temp_file))
 
     def _write_tmp_config_file(self):
         contents = '[DEFAULT]\n'
@@ -102,7 +107,9 @@ class TestConfigOpts(config.GlanceConfigOpts):
                 f.write(contents)
                 f.flush()
         except Exception, e:
-            os.remove(self.temp_file)
+            if self.clean:
+                os.remove(self.temp_file)
+                os.rmdir(os.path.dirname(self.temp_file))
             raise e
 
 
@@ -154,6 +161,41 @@ class skip_unless(object):
         return _skipper
 
 
+class requires(object):
+    """Decorator that initiates additional test setup/teardown."""
+    def __init__(self, setup, teardown=None):
+        self.setup = setup
+        self.teardown = teardown
+
+    def __call__(self, func):
+        def _runner(*args, **kw):
+            self.setup(args[0])
+            func(*args, **kw)
+            if self.teardown:
+                self.teardown(args[0])
+        _runner.__name__ = func.__name__
+        _runner.__doc__ = func.__doc__
+        return _runner
+
+
+class depends_on_exe(object):
+    """Decorator to skip test if an executable is unavailable"""
+    def __init__(self, exe):
+        self.exe = exe
+
+    def __call__(self, func):
+        def _runner(*args, **kw):
+            cmd = 'which %s' % self.exe
+            exitcode, out, err = execute(cmd, raise_error=False)
+            if exitcode != 0:
+                args[0].disabled_message = 'test requires exe: %s' % self.exe
+                args[0].disabled = True
+            func(*args, **kw)
+        _runner.__name__ = func.__name__
+        _runner.__doc__ = func.__doc__
+        return _runner
+
+
 def skip_if_disabled(func):
     """Decorator that skips a test if test case is disabled."""
     @functools.wraps(func)
@@ -173,7 +215,8 @@ def execute(cmd,
             no_venv=False,
             exec_env=None,
             expect_exit=True,
-            expected_exitcode=0):
+            expected_exitcode=0,
+            context=None):
     """
     Executes a command in a subprocess. Returns a tuple
     of (exitcode, out, err), where out is the string output
@@ -190,6 +233,7 @@ def execute(cmd,
                      environment variable
     :param expect_exit: Optional flag true iff timely exit is expected
     :param expected_exitcode: expected exitcode from the launcher
+    :param context: additional context for error message
     """
 
     env = os.environ.copy()
@@ -237,6 +281,8 @@ def execute(cmd,
               "code of %(exitcode)d."\
               "\n\nSTDOUT: %(out)s"\
               "\n\nSTDERR: %(err)s" % locals()
+        if context:
+            msg += "\n\nCONTEXT: %s" % context
         raise RuntimeError(msg)
     return exitcode, out, err
 
@@ -310,3 +356,36 @@ def xattr_writes_supported(path):
             os.unlink(fake_filepath)
 
     return result
+
+
+def minimal_headers(name, public=True):
+    headers = {'Content-Type': 'application/octet-stream',
+               'X-Image-Meta-Name': name,
+               'X-Image-Meta-disk_format': 'raw',
+               'X-Image-Meta-container_format': 'ovf',
+    }
+    if public:
+        headers['X-Image-Meta-Is-Public'] = 'True'
+    return headers
+
+
+def minimal_add_command(port, name, suffix='', public=True):
+    visibility = 'is_public=True' if public else ''
+    return ("bin/glance --port=%d add %s"
+            " disk_format=raw container_format=ovf"
+            " name=%s %s" % (port, visibility, name, suffix))
+
+
+class FakeAuthMiddleware(wsgi.Middleware):
+
+    def __init__(self, app, conf, **local_conf):
+        super(FakeAuthMiddleware, self).__init__(app)
+
+    def process_request(self, req):
+        auth_tok = req.headers.get('X-Auth-Token')
+        if auth_tok:
+            status, user, tenant, role = auth_tok.split(':')
+            req.headers['X-Identity-Status'] = status
+            req.headers['X-User-Id'] = user
+            req.headers['X-Tenant-Id'] = tenant
+            req.headers['X-Role'] = role

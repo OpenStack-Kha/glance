@@ -451,7 +451,7 @@ class Resource(object):
     may raise a webob.exc exception or return a dict, which will be
     serialized by requested content type.
     """
-    def __init__(self, controller, deserializer, serializer):
+    def __init__(self, controller, deserializer=None, serializer=None):
         """
         :param controller: object that implement methods created by routes lib
         :param deserializer: object that supports webob request deserialization
@@ -460,8 +460,8 @@ class Resource(object):
                            through controller-like actions
         """
         self.controller = controller
-        self.serializer = serializer
-        self.deserializer = deserializer
+        self.serializer = serializer or JSONResponseSerializer()
+        self.deserializer = deserializer or JSONRequestDeserializer()
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, request):
@@ -533,7 +533,7 @@ class BasePasteFactory(object):
         """Import an app/filter class.
 
         Lookup the KEY from the PasteDeploy local conf and import the
-        class named there. This class can then be used as an app or
+        class named therein. This class can then be used as an app or
         filter factory.
 
         Note we support the <module>:<class> format.

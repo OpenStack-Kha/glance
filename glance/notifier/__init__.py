@@ -17,8 +17,8 @@
 
 
 import datetime
-import uuid
 import socket
+import uuid
 
 from glance.common import cfg
 from glance.common import exception
@@ -28,6 +28,7 @@ from glance.common import utils
 _STRATEGIES = {
     "logging": "glance.notifier.notify_log.LoggingStrategy",
     "rabbit": "glance.notifier.notify_kombu.RabbitStrategy",
+    "qpid": "glance.notifier.notify_qpid.QpidStrategy",
     "noop": "glance.notifier.notify_noop.NoopStrategy",
     "default": "glance.notifier.notify_noop.NoopStrategy",
 }
@@ -45,7 +46,7 @@ class Notifier(object):
         strategy = conf.notifier_strategy
         try:
             self.strategy = utils.import_class(_STRATEGIES[strategy])(conf)
-        except KeyError, ImportError:
+        except (KeyError, ImportError):
             raise exception.InvalidNotifierStrategy(strategy=strategy)
 
     @staticmethod

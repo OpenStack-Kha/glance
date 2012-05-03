@@ -17,17 +17,13 @@
 
 """Functional test case that utilizes the bin/glance-cache-manage CLI tool"""
 
-import datetime
 import hashlib
 import httplib2
 import json
 import os
-import time
-import unittest
 
-from glance.common import utils
 from glance.tests import functional
-from glance.tests.utils import execute
+from glance.tests.utils import execute, minimal_headers
 
 FIVE_KB = 5 * 1024
 
@@ -54,9 +50,7 @@ class TestBinGlanceCacheManage(functional.FunctionalTest):
         image identifier.
         """
         image_data = "*" * FIVE_KB
-        headers = {'Content-Type': 'application/octet-stream',
-                   'X-Image-Meta-Name': name,
-                   'X-Image-Meta-Is-Public': 'true'}
+        headers = minimal_headers(name)
         path = "http://%s:%d/v1/images" % ("0.0.0.0", self.api_port)
         http = httplib2.Http()
         response, content = http.request(path, 'POST', headers=headers,
