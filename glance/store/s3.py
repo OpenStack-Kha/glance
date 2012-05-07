@@ -20,11 +20,13 @@
 import logging
 import hashlib
 import httplib
+import re
 import tempfile
 import urlparse
 
 from glance.common import cfg
 from glance.common import exception
+from glance.common import utils
 import glance.store
 import glance.store.base
 import glance.store.location
@@ -189,8 +191,8 @@ class Store(glance.store.base.Store):
 
     opts = [
         cfg.StrOpt('s3_store_host'),
-        cfg.StrOpt('s3_store_access_key'),
-        cfg.StrOpt('s3_store_secret_key'),
+        cfg.StrOpt('s3_store_access_key', secret=True),
+        cfg.StrOpt('s3_store_secret_key', secret=True),
         cfg.StrOpt('s3_store_bucket'),
         cfg.StrOpt('s3_store_object_buffer_dir'),
         cfg.BoolOpt('s3_store_create_bucket_on_put', default=False),
@@ -250,7 +252,13 @@ class Store(glance.store.base.Store):
         key = self._retrieve_key(location)
 
         key.BufferSize = self.CHUNKSIZE
-        return (ChunkedFile(key), key.size)
+
+        class ChunkedIndexable(glance.store.Indexable):
+            def another(self):
+                return (self.wrapped.fp.read(ChunkedFile.CHUNKSIZE)
+                        if self.wrapped.fp else None)
+
+        return (ChunkedIndexable(ChunkedFile(key), key.size), key.size)
 
     def get_size(self, location):
         """
@@ -328,10 +336,16 @@ class Store(glance.store.base.Store):
         bucket_obj = get_bucket(s3_conn, self.bucket)
         obj_name = str(image_id)
 
+        def _sanitize(uri):
+            return re.sub('//.*:.*@',
+                          '//s3_store_secret_key:s3_store_access_key@',
+                          uri)
+
         key = bucket_obj.get_key(obj_name)
         if key and key.exists():
             raise exception.Duplicate(_("S3 already has an image at "
-                                      "location %s") % loc.get_uri())
+                                      "location %s") %
+                                      _sanitize(loc.get_uri()))
 
         msg = _("Adding image object to S3 using (s3_host=%(s3_host)s, "
                 "access_key=%(access_key)s, bucket=%(bucket)s, "
@@ -355,20 +369,19 @@ class Store(glance.store.base.Store):
         # writing the tempfile, so we don't need to call key.compute_md5()
 
         msg = _("Writing request body file to temporary file "
-                "for %s") % loc.get_uri()
+                "for %s") % _sanitize(loc.get_uri())
         logger.debug(msg)
 
         tmpdir = self.s3_store_object_buffer_dir
         temp_file = tempfile.NamedTemporaryFile(dir=tmpdir)
         checksum = hashlib.md5()
-        chunk = image_file.read(self.CHUNKSIZE)
-        while chunk:
+        for chunk in utils.chunkreadable(image_file, self.CHUNKSIZE):
             checksum.update(chunk)
             temp_file.write(chunk)
-            chunk = image_file.read(self.CHUNKSIZE)
         temp_file.flush()
 
-        msg = _("Uploading temporary file to S3 for %s") % loc.get_uri()
+        msg = (_("Uploading temporary file to S3 for %s") %
+               _sanitize(loc.get_uri()))
         logger.debug(msg)
 
         # OK, now upload the data into the key
@@ -429,6 +442,22 @@ def get_bucket(conn, bucket_id):
     return bucket
 
 
+def get_s3_location(s3_host):
+    from boto.s3.connection import Location
+    locations = {
+        's3.amazonaws.com': Location.DEFAULT,
+        's3-eu-west-1.amazonaws.com': Location.EU,
+        's3-us-west-1.amazonaws.com': Location.USWest,
+        's3-ap-southeast-1.amazonaws.com': Location.APSoutheast,
+        's3-ap-northeast-1.amazonaws.com': Location.APNortheast,
+    }
+    # strip off scheme and port if present
+    key = re.sub('^(https?://)?(?P<host>[^:]+)(:[0-9]+)?$',
+                 '\g<host>',
+                 s3_host)
+    return locations.get(key, Location.DEFAULT)
+
+
 def create_bucket_if_missing(bucket, s3_conn, conf):
     """
     Creates a missing bucket in S3 if the
@@ -444,8 +473,9 @@ def create_bucket_if_missing(bucket, s3_conn, conf):
     except S3ResponseError, e:
         if e.status == httplib.NOT_FOUND:
             if conf.s3_store_create_bucket_on_put:
+                location = get_s3_location(conf.s3_store_host)
                 try:
-                    s3_conn.create_bucket(bucket)
+                    s3_conn.create_bucket(bucket, location=location)
                 except S3ResponseError, e:
                     msg = ("Failed to add bucket to S3.\n"
                            "Got error from S3: %(e)s" % locals())

@@ -16,16 +16,14 @@
 #    under the License.
 
 import logging
-import optparse
 import os
 import sys
 import time
-import urlparse
 
-from glance import registry
 from glance.common import cfg
 from glance.common import exception
 from glance.common import utils
+from glance import registry
 from glance.store import location
 
 logger = logging.getLogger('glance.store')
@@ -64,6 +62,70 @@ class BackendException(Exception):
 
 class UnsupportedBackend(BackendException):
     pass
+
+
+class Indexable(object):
+
+    """
+    Wrapper that allows an iterator or filelike be treated as an indexable
+    data structure. This is required in the case where the return value from
+    Store.get() is passed to Store.add() when adding a Copy-From image to a
+    Store where the client library relies on eventlet GreenSockets, in which
+    case the data to be written is indexed over.
+    """
+
+    def __init__(self, wrapped, size):
+        """
+        Initialize the object
+
+        :param wrappped: the wrapped iterator or filelike.
+        :param size: the size of data available
+        """
+        self.wrapped = wrapped
+        self.size = int(size) if size else (wrapped.len
+                                            if hasattr(wrapped, 'len') else 0)
+        self.cursor = 0
+        self.chunk = None
+
+    def __iter__(self):
+        """
+        Delegate iteration to the wrapped instance.
+        """
+        for self.chunk in self.wrapped:
+            yield self.chunk
+
+    def __getitem__(self, i):
+        """
+        Index into the next chunk (or previous chunk in the case where
+        the last data returned was not fully consumed).
+
+        :param i: a slice-to-the-end
+        """
+        start = i.start if isinstance(i, slice) else i
+        if start < self.cursor:
+            return self.chunk[(start - self.cursor):]
+
+        self.chunk = self.another()
+        if self.chunk:
+            self.cursor += len(self.chunk)
+
+        return self.chunk
+
+    def another(self):
+        """Implemented by subclasses to return the next element"""
+        raise NotImplementedError
+
+    def getvalue(self):
+        """
+        Return entire string value... used in testing
+        """
+        return self.wrapped.getvalue()
+
+    def __len__(self):
+        """
+        Length accessor.
+        """
+        return self.size
 
 
 def register_store(store_module, schemes):

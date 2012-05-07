@@ -25,6 +25,7 @@ and spinning down the servers.
 
 import datetime
 import functools
+import json
 import os
 import re
 import shutil
@@ -92,7 +93,9 @@ class Server(object):
     def write_conf(self, **kwargs):
         """
         Writes the configuration file for the server to its intended
-        destination.  Returns the name of the configuration file.
+        destination.  Returns the name of the configuration file and
+        the over-ridden config content (may be useful for populating
+        error messages).
         """
 
         if self.conf_file_name:
@@ -112,22 +115,24 @@ class Server(object):
         paste_conf_filepath = conf_filepath.replace(".conf", "-paste.ini")
         utils.safe_mkdirs(conf_dir)
 
-        def override_conf(filepath, base, override):
+        def override_conf(filepath, overridden):
             with open(filepath, 'wb') as conf_file:
-                conf_file.write(base % override)
+                conf_file.write(overridden)
                 conf_file.flush()
                 return conf_file.name
 
-        self.conf_file_name = override_conf(conf_filepath,
-                                            self.conf_base,
-                                            conf_override)
+        overridden_core = self.conf_base % conf_override
+        self.conf_file_name = override_conf(conf_filepath, overridden_core)
 
+        overridden_paste = ''
         if self.paste_conf_base:
-            override_conf(paste_conf_filepath,
-                          self.paste_conf_base,
-                          conf_override)
+            overridden_paste = self.paste_conf_base % conf_override
+            override_conf(paste_conf_filepath, overridden_paste)
 
-        return self.conf_file_name
+        overridden = ('==Core config==\n%s\n==Paste config==\n%s' %
+                      (overridden_core, overridden_paste))
+
+        return self.conf_file_name, overridden
 
     def start(self, expect_exit=True, expected_exitcode=0, **kwargs):
         """
@@ -138,7 +143,7 @@ class Server(object):
         """
 
         # Ensure the configuration file is written
-        self.write_conf(**kwargs)
+        overridden = self.write_conf(**kwargs)[1]
 
         cmd = ("%(server_control)s %(server_name)s start "
                "%(conf_file_name)s --pid-file=%(pid_file)s "
@@ -148,7 +153,8 @@ class Server(object):
                        no_venv=self.no_venv,
                        exec_env=self.exec_env,
                        expect_exit=expect_exit,
-                       expected_exitcode=expected_exitcode)
+                       expected_exitcode=expected_exitcode,
+                       context=overridden)
 
     def stop(self):
         """
@@ -254,6 +260,9 @@ pipeline = versionnegotiation context cache apiv1app
 [pipeline:glance-api-cachemanagement]
 pipeline = versionnegotiation context cache cache_manage apiv1app
 
+[pipeline:glance-api-fakeauth]
+pipeline = versionnegotiation fakeauth context apiv1app
+
 [app:apiv1app]
 paste.app_factory = glance.common.wsgi:app_factory
 glance.app_factory = glance.api.v1.router:API
@@ -274,6 +283,10 @@ glance.filter_factory = glance.api.middleware.cache_manage:CacheManageFilter
 [filter:context]
 paste.filter_factory = glance.common.wsgi:filter_factory
 glance.filter_factory = glance.common.context:ContextMiddleware
+
+[filter:fakeauth]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.tests.utils:FakeAuthMiddleware
 """
 
 
@@ -313,6 +326,9 @@ flavor = %(deployment_flavor)s
         self.paste_conf_base = """[pipeline:glance-registry]
 pipeline = context registryapp
 
+[pipeline:glance-registry-fakeauth]
+pipeline = fakeauth context registryapp
+
 [app:registryapp]
 paste.app_factory = glance.common.wsgi:app_factory
 glance.app_factory = glance.registry.api.v1:API
@@ -321,6 +337,10 @@ glance.app_factory = glance.registry.api.v1:API
 context_class = glance.registry.context.RequestContext
 paste.filter_factory = glance.common.wsgi:filter_factory
 glance.filter_factory = glance.common.context:ContextMiddleware
+
+[filter:fakeauth]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.tests.utils:FakeAuthMiddleware
 """
 
 
@@ -365,6 +385,7 @@ class FunctionalTest(unittest.TestCase):
 
     inited = False
     disabled = False
+    log_files = []
 
     def setUp(self):
         self.test_id, self.test_dir = test_utils.get_isolated_test_env()
@@ -390,6 +411,7 @@ class FunctionalTest(unittest.TestCase):
                           self.registry_server.pid_file,
                           self.scrubber_daemon.pid_file]
         self.files_to_destroy = []
+        self.log_files = []
 
     def tearDown(self):
         if not self.disabled:
@@ -398,6 +420,11 @@ class FunctionalTest(unittest.TestCase):
             # and recreate it, which ensures that we have no side-effects
             # from the tests
             self._reset_database(self.registry_server.sql_connection)
+
+    def set_policy_rules(self, rules):
+        fap = open(self.policy_file, 'w')
+        fap.write(json.dumps(rules))
+        fap.close()
 
     def _reset_database(self, conn_string):
         conn_pieces = urlparse.urlparse(conn_string)
@@ -480,6 +507,8 @@ class FunctionalTest(unittest.TestCase):
 
             self.assertTrue(re.search("Starting glance-[a-z]+ with", out))
 
+        self.log_files.append(server.log_file)
+
         self.wait_for_servers([server.bind_port], expect_launch)
 
     def start_servers(self, **kwargs):
@@ -495,12 +524,16 @@ class FunctionalTest(unittest.TestCase):
         # Start up the API and default registry server
         exitcode, out, err = self.api_server.start(**kwargs)
 
+        self.log_files.append(self.api_server.log_file)
+
         self.assertEqual(0, exitcode,
                          "Failed to spin up the API server. "
                          "Got: %s" % err)
         self.assertTrue("Starting glance-api with" in out)
 
         exitcode, out, err = self.registry_server.start(**kwargs)
+
+        self.log_files.append(self.registry_server.log_file)
 
         self.assertEqual(0, exitcode,
                          "Failed to spin up the Registry server. "
@@ -614,3 +647,15 @@ class FunctionalTest(unittest.TestCase):
         shutil.copy(src_file_name, dst_dir)
         dst_file_name = os.path.join(dst_dir, file_name)
         return dst_file_name
+
+    def dump_logs(self):
+        dump = ''
+        for log in self.log_files:
+            dump += '\nContent of %s:\n\n' % log
+            if os.path.exists(log):
+                f = open(log, 'r')
+                for line in f:
+                    dump += line
+            else:
+                dump += '<empty>'
+        return dump

@@ -23,7 +23,6 @@ import hashlib
 import httplib
 import logging
 import math
-import tempfile
 import urlparse
 
 from glance.common import cfg
@@ -191,8 +190,9 @@ class Store(glance.store.base.Store):
     opts = [
         cfg.BoolOpt('swift_enable_snet', default=False),
         cfg.StrOpt('swift_store_auth_address'),
-        cfg.StrOpt('swift_store_user'),
-        cfg.StrOpt('swift_store_key'),
+        cfg.StrOpt('swift_store_user', secret=True),
+        cfg.StrOpt('swift_store_key', secret=True),
+        cfg.StrOpt('swift_store_auth_version', default='2'),
         cfg.StrOpt('swift_store_container',
                    default=DEFAULT_CONTAINER),
         cfg.IntOpt('swift_store_large_object_size',
@@ -205,6 +205,7 @@ class Store(glance.store.base.Store):
     def configure(self):
         self.conf.register_opts(self.opts)
         self.snet = self.conf.swift_enable_snet
+        self.auth_version = self._option_get('swift_store_auth_version')
 
     def configure_add(self):
         """
@@ -266,14 +267,15 @@ class Store(glance.store.base.Store):
             else:
                 raise
 
-        #if expected_size:
-        #    obj_size = int(resp_headers['content-length'])
-        #    if  obj_size != expected_size:
-        #        raise glance.store.BackendException(
-        #            "Expected %s byte file, Swift has %s bytes" %
-        #            (expected_size, obj_size))
+        class ResponseIndexable(glance.store.Indexable):
+            def another(self):
+                try:
+                    return self.wrapped.next()
+                except StopIteration:
+                    return ''
 
-        return (resp_body, resp_headers.get('content-length'))
+        length = resp_headers.get('content-length')
+        return (ResponseIndexable(resp_body, length), length)
 
     def get_size(self, location):
         """
@@ -300,11 +302,16 @@ class Store(glance.store.base.Store):
         Creates a connection using the Swift client library.
         """
         snet = self.snet
+        auth_version = self.auth_version
+        full_auth_url = (auth_url if not auth_url or auth_url.endswith('/')
+                         else auth_url + '/')
         logger.debug(_("Creating Swift connection with "
-                     "(auth_address=%(auth_url)s, user=%(user)s, "
-                     "snet=%(snet)s)") % locals())
+                     "(auth_address=%(full_auth_url)s, user=%(user)s, "
+                     "snet=%(snet)s, auth_version=%(auth_version)s)") %
+                     locals())
         return swift_client.Connection(
-            authurl=auth_url, user=user, key=key, snet=snet)
+            authurl=full_auth_url, user=user, key=key, snet=snet,
+            auth_version=auth_version)
 
     def _option_get(self, param):
         result = getattr(self.conf, param)
@@ -440,8 +447,8 @@ class Store(glance.store.base.Store):
                 # of each chunk...so we ignore this result in favour of
                 # the MD5 of the entire image file contents, so that
                 # users can verify the image file contents accordingly
-                _ignored = swift_conn.put_object(self.container, obj_name,
-                                                 None, headers=headers)
+                swift_conn.put_object(self.container, obj_name,
+                                      None, headers=headers)
                 obj_etag = checksum.hexdigest()
 
             # NOTE: We return the user and key here! Have to because
@@ -542,7 +549,7 @@ def create_container_if_missing(container, swift_conn, conf):
             if conf.swift_store_create_container_on_put:
                 try:
                     swift_conn.put_container(container)
-                except ClientException, e:
+                except swift_client.ClientException, e:
                     msg = _("Failed to add container to Swift.\n"
                            "Got error from Swift: %(e)s") % locals()
                     raise glance.store.BackendException(msg)

@@ -3,6 +3,7 @@
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2010-2011 OpenStack LLC.
+# Copyright 2012 Justin Santa Barbara
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,10 +23,12 @@ Defines interface for DB access
 """
 
 import logging
+import time
 
+import sqlalchemy
 from sqlalchemy import asc, create_engine, desc
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import IntegrityError, OperationalError, DBAPIError,\
+    DisconnectionError
 from sqlalchemy.orm import exc
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import sessionmaker
@@ -34,10 +37,13 @@ from sqlalchemy.sql import or_, and_
 from glance.common import cfg
 from glance.common import exception
 from glance.common import utils
+from glance.registry.db import migration
 from glance.registry.db import models
 
 _ENGINE = None
 _MAKER = None
+_MAX_RETRIES = None
+_RETRY_INTERVAL = None
 BASE = models.BASE
 sa_logger = None
 logger = logging.getLogger(__name__)
@@ -61,7 +67,30 @@ STATUSES = ['active', 'saving', 'queued', 'killed', 'pending_delete',
 db_opts = [
     cfg.IntOpt('sql_idle_timeout', default=3600),
     cfg.StrOpt('sql_connection', default='sqlite:///glance.sqlite'),
+    cfg.IntOpt('sql_max_retries', default=10),
+    cfg.IntOpt('sql_retry_interval', default=1)
     ]
+
+
+class MySQLPingListener(object):
+
+    """
+    Ensures that MySQL connections checked out of the
+    pool are alive.
+
+    Borrowed from:
+    http://groups.google.com/group/sqlalchemy/msg/a4ce563d802c929f
+    """
+
+    def checkout(self, dbapi_con, con_record, con_proxy):
+        try:
+            dbapi_con.cursor().execute('select 1')
+        except dbapi_con.OperationalError, ex:
+            if ex.args[0] in (2006, 2013, 2014, 2045, 2055):
+                logger.warn('Got mysql server has gone away: %s', ex)
+                raise DisconnectionError("Database server went away")
+            else:
+                raise
 
 
 def configure_db(conf):
@@ -71,13 +100,24 @@ def configure_db(conf):
 
     :param conf: Mapping of configuration options
     """
-    global _ENGINE, sa_logger, logger
+    global _ENGINE, sa_logger, logger, _MAX_RETRIES, _RETRY_INTERVAL
     if not _ENGINE:
         conf.register_opts(db_opts)
-        timeout = conf.sql_idle_timeout
         sql_connection = conf.sql_connection
+        _MAX_RETRIES = conf.sql_max_retries
+        _RETRY_INTERVAL = conf.sql_retry_interval
+        connection_dict = sqlalchemy.engine.url.make_url(sql_connection)
+        engine_args = {'pool_recycle': conf.sql_idle_timeout,
+                       'echo': False,
+                       'convert_unicode': True
+                       }
+        if 'mysql' in connection_dict.drivername:
+            engine_args['listeners'] = [MySQLPingListener()]
+
         try:
-            _ENGINE = create_engine(sql_connection, pool_recycle=timeout)
+            _ENGINE = create_engine(sql_connection, **engine_args)
+            _ENGINE.connect = wrap_db_error(_ENGINE.connect)
+            _ENGINE.connect()
         except Exception, err:
             msg = _("Error configuring registry database with supplied "
                     "sql_connection '%(sql_connection)s'. "
@@ -92,6 +132,11 @@ def configure_db(conf):
             sa_logger.setLevel(logging.INFO)
 
         models.register_models(_ENGINE)
+        try:
+            migration.version_control(conf)
+        except exception.DatabaseMigrationError:
+            # only arises when the DB exists and is under version control
+            pass
 
 
 def check_mutate_authorization(context, image_ref):
@@ -99,9 +144,9 @@ def check_mutate_authorization(context, image_ref):
         logger.info(_("Attempted to modify image user did not own."))
         msg = _("You do not own this image")
         if image_ref.is_public:
-            exc_class = exception.NotAuthorizedPublicImage
+            exc_class = exception.ForbiddenPublicImage
         else:
-            exc_class = exception.NotAuthorized
+            exc_class = exception.Forbidden
 
         raise exc_class(msg)
 
@@ -115,6 +160,48 @@ def get_session(autocommit=True, expire_on_commit=False):
                               autocommit=autocommit,
                               expire_on_commit=expire_on_commit)
     return _MAKER()
+
+
+def is_db_connection_error(args):
+    """Return True if error in connecting to db."""
+    # NOTE(adam_g): This is currently MySQL specific and needs to be extended
+    #               to support Postgres and others.
+    conn_err_codes = ('2002', '2003', '2006')
+    for err_code in conn_err_codes:
+        if args.find(err_code) != -1:
+            return True
+    return False
+
+
+def wrap_db_error(f):
+    """Retry DB connection. Copied from nova and modified."""
+    def _wrap(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except OperationalError, e:
+            if not is_db_connection_error(e.args[0]):
+                raise
+
+            global _MAX_RETRIES
+            global _RETRY_INTERVAL
+            remaining_attempts = _MAX_RETRIES
+            while True:
+                logger.warning(_('SQL connection failed. %d attempts left.'),
+                                remaining_attempts)
+                remaining_attempts -= 1
+                time.sleep(_RETRY_INTERVAL)
+                try:
+                    return f(*args, **kwargs)
+                except OperationalError, e:
+                    if remaining_attempts == 0 or \
+                       not is_db_connection_error(e.args[0]):
+                        raise
+                except DBAPIError:
+                    raise
+        except DBAPIError:
+            raise
+    _wrap.func_name = f.func_name
+    return _wrap
 
 
 def image_create(context, values):
@@ -170,9 +257,104 @@ def image_get(context, image_id, session=None, force_show_deleted=False):
 
     # Make sure they can look at it
     if not context.is_image_visible(image):
-        raise exception.NotAuthorized("Image not visible to you")
+        raise exception.Forbidden("Image not visible to you")
 
     return image
+
+
+def paginate_query(query, model, limit, sort_keys, marker=None,
+                   sort_dir=None, sort_dirs=None):
+    """Returns a query with sorting / pagination criteria added.
+
+    Pagination works by requiring a unique sort_key, specified by sort_keys.
+    (If sort_keys is not unique, then we risk looping through values.)
+    We use the last row in the previous page as the 'marker' for pagination.
+    So we must return values that follow the passed marker in the order.
+    With a single-valued sort_key, this would be easy: sort_key > X.
+    With a compound-values sort_key, (k1, k2, k3) we must do this to repeat
+    the lexicographical ordering:
+    (k1 > X1) or (k1 == X1 && k2 > X2) or (k1 == X1 && k2 == X2 && k3 > X3)
+
+    We also have to cope with different sort_directions.
+
+    Typically, the id of the last row is used as the client-facing pagination
+    marker, then the actual marker object must be fetched from the db and
+    passed in to us as marker.
+
+    :param query: the query object to which we should add paging/sorting
+    :param model: the ORM model class
+    :param limit: maximum number of items to return
+    :param sort_keys: array of attributes by which results should be sorted
+    :param marker: the last item of the previous page; we returns the next
+                    results after this value.
+    :param sort_dir: direction in which results should be sorted (asc, desc)
+    :param sort_dirs: per-column array of sort_dirs, corresponding to sort_keys
+
+    :rtype: sqlalchemy.orm.query.Query
+    :return: The query with sorting/pagination added.
+    """
+
+    if 'id' not in sort_keys:
+        # TODO(justinsb): If this ever gives a false-positive, check
+        # the actual primary key, rather than assuming it's id
+        logger.warn(_('Id not in sort_keys; is sort_keys unique?'))
+
+    assert(not (sort_dir and sort_dirs))
+
+    # Default the sort direction to ascending
+    if sort_dirs is None and sort_dir is None:
+        sort_dir = 'asc'
+
+    # Ensure a per-column sort direction
+    if sort_dirs is None:
+        sort_dirs = [sort_dir for _sort_key in sort_keys]
+
+    assert(len(sort_dirs) == len(sort_keys))
+
+    # Add sorting
+    for current_sort_key, current_sort_dir in zip(sort_keys, sort_dirs):
+        sort_dir_func = {
+            'asc': asc,
+            'desc': desc,
+        }[current_sort_dir]
+
+        sort_key_attr = getattr(model, current_sort_key)
+        query = query.order_by(sort_dir_func(sort_key_attr))
+
+    # Add pagination
+    if marker is not None:
+        marker_values = []
+        for sort_key in sort_keys:
+            v = getattr(marker, sort_key)
+            marker_values.append(v)
+
+        # Build up an array of sort criteria as in the docstring
+        criteria_list = []
+        for i in xrange(0, len(sort_keys)):
+            crit_attrs = []
+            for j in xrange(0, i):
+                model_attr = getattr(model, sort_keys[j])
+                crit_attrs.append((model_attr == marker_values[j]))
+
+            model_attr = getattr(model, sort_keys[i])
+            if sort_dirs[i] == 'desc':
+                crit_attrs.append((model_attr < marker_values[i]))
+            elif sort_dirs[i] == 'asc':
+                crit_attrs.append((model_attr > marker_values[i]))
+            else:
+                raise ValueError(_("Unknown sort direction, "
+                                   "must be 'desc' or 'asc'"))
+
+            criteria = and_(*crit_attrs)
+            criteria_list.append(criteria)
+
+        f = or_(*criteria_list)
+        query = query.filter(f)
+
+    if limit is not None:
+        query = query.limit(limit)
+
+    return query
 
 
 def image_get_all(context, filters=None, marker=None, limit=None,
@@ -194,16 +376,6 @@ def image_get_all(context, filters=None, marker=None, limit=None,
     query = session.query(models.Image).\
                    options(joinedload(models.Image.properties)).\
                    options(joinedload(models.Image.members))
-
-    sort_dir_func = {
-        'asc': asc,
-        'desc': desc,
-    }[sort_dir]
-
-    sort_key_attr = getattr(models.Image, sort_key)
-    query = query.order_by(sort_dir_func(sort_key_attr))\
-                 .order_by(sort_dir_func(models.Image.created_at))\
-                 .order_by(sort_dir_func(models.Image.id))
 
     if 'size_min' in filters:
         query = query.filter(models.Image.size >= filters['size_min'])
@@ -227,7 +399,9 @@ def image_get_all(context, filters=None, marker=None, limit=None,
 
     showing_deleted = False
     if 'changes-since' in filters:
-        changes_since = filters.pop('changes-since')
+        # normalize timestamp to UTC, as sqlalchemy doesn't appear to
+        # respect timezone offsets
+        changes_since = utils.normalize_time(filters.pop('changes-since'))
         query = query.filter(models.Image.updated_at > changes_since)
         showing_deleted = True
 
@@ -246,26 +420,15 @@ def image_get_all(context, filters=None, marker=None, limit=None,
         if v is not None:
             query = query.filter(getattr(models.Image, k) == v)
 
-    if marker != None:
-        # images returned should be created before the image defined by marker
+    marker_image = None
+    if marker is not None:
         marker_image = image_get(context, marker,
                                  force_show_deleted=showing_deleted)
-        marker_value = getattr(marker_image, sort_key)
-        if sort_dir == 'desc':
-            query = query.filter(
-                or_(sort_key_attr < marker_value,
-                    and_(sort_key_attr == marker_value,
-                         models.Image.created_at < marker_image.created_at,
-                         models.Image.id < marker)))
-        else:
-            query = query.filter(
-                or_(sort_key_attr > marker_value,
-                    and_(sort_key_attr == marker_value,
-                         models.Image.created_at > marker_image.created_at,
-                         models.Image.id > marker)))
 
-    if limit != None:
-        query = query.limit(limit)
+    query = paginate_query(query, models.Image, limit,
+                           [sort_key, 'created_at', 'id'],
+                           marker=marker_image,
+                           sort_dir=sort_dir)
 
     return query.all()
 
@@ -300,11 +463,21 @@ def validate_image(values):
         msg = "Invalid image status '%s' for image." % status
         raise exception.Invalid(msg)
 
-    if disk_format and disk_format not in DISK_FORMATS:
+    def _required_format_absent(format, formats):
+        activating = status == 'active'
+        unrecognized = format not in formats
+        # We don't mind having format = None when we're just registering
+        # an image, but if the image is being activated, make sure that the
+        # format is valid. Conversely if the format happens to be set on
+        # registration, it must be one of the recognized formats.
+        return ((activating and (not format or unrecognized))
+                or (not activating and format and unrecognized))
+
+    if _required_format_absent(disk_format, DISK_FORMATS):
         msg = "Invalid disk format '%s' for image." % disk_format
         raise exception.Invalid(msg)
 
-    if container_format and container_format not in CONTAINER_FORMATS:
+    if _required_format_absent(container_format, CONTAINER_FORMATS):
         msg = "Invalid container format '%s' for image." % container_format
         raise exception.Invalid(msg)
 
@@ -316,6 +489,11 @@ def validate_image(values):
                    "one of 'ami', 'ari', or 'ami', the container "
                    "and disk formats must match.")
             raise exception.Invalid(msg)
+
+    name = values.get('name')
+    if name and len(name) > 255:
+        msg = _('Image name too long: %d') % len(name)
+        raise exception.Invalid(msg)
 
 
 def _image_update(context, values, image_id, purge_props=False):
@@ -495,7 +673,7 @@ def image_member_get(context, member_id, session=None):
 
     # Make sure they can look at it
     if not context.is_image_visible(member.image):
-        raise exception.NotAuthorized("Image not visible to you")
+        raise exception.Forbidden("Image not visible to you")
 
     return member
 
@@ -541,34 +719,16 @@ def image_member_get_memberships(context, member, marker=None, limit=None,
     if not can_show_deleted(context):
         query = query.filter_by(deleted=False)
 
-    sort_dir_func = {
-        'asc': asc,
-        'desc': desc,
-    }[sort_dir]
-
-    sort_key_attr = getattr(models.ImageMember, sort_key)
-
-    query = query.order_by(sort_dir_func(sort_key_attr)).\
-                  order_by(sort_dir_func(models.ImageMember.id))
-
-    if marker != None:
+    marker_membership = None
+    if marker is not None:
         # memberships returned should be created before the membership
         # defined by marker
         marker_membership = image_member_get(context, marker)
-        marker_value = getattr(marker_membership, sort_key)
-        if sort_dir == 'desc':
-            query = query.filter(
-                or_(sort_key_attr < marker_value,
-                    and_(sort_key_attr == marker_value,
-                         models.ImageMember.id < marker)))
-        else:
-            query = query.filter(
-                or_(sort_key_attr > marker_value,
-                    and_(sort_key_attr == marker_value,
-                         models.ImageMember.id > marker)))
 
-    if limit != None:
-        query = query.limit(limit)
+    query = paginate_query(query, models.ImageMember, limit,
+                           [sort_key, 'id'],
+                           marker=marker_membership,
+                           sort_dir=sort_dir)
 
     return query.all()
 

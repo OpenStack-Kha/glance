@@ -170,12 +170,14 @@ class RabbitStrategy(strategy.Strategy):
 
     def log_failure(self, msg, priority):
         """Fallback to logging when we can't send to rabbit."""
-        logger.error(_('Notification with priority %(priority)s failed; '
-                'msg=%s') % msg)
+        message = _('Notification with priority %(priority)s failed: '
+                    'msg=%(msg)s')
+        logger.error(message % {'msg': msg, 'priority': priority})
 
     def _send_message(self, msg, routing_key):
         """Send a message.  Caller needs to catch exceptions for retry."""
-        msg = self.exchange.Message(json.dumps(message))
+        msg = self.exchange.Message(json.dumps(msg),
+                                    content_type='application/json')
         self.exchange.publish(msg, routing_key=routing_key)
 
     def _notify(self, msg, priority):

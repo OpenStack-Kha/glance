@@ -75,7 +75,8 @@ class AuthorsTestCase(unittest.TestCase):
 class UtilsTestCase(unittest.TestCase):
 
     def test_bool_from_string(self):
-        true_values = ['True', True, 'true', 'TRUE', '1', 1, 'on', 'ON']
+        true_values = ['True', True, 'true', 'TRUE', '1', 1, 'on',
+                       'ON', 'y', 'yes', 'Y', 'YES']
 
         i = 0
         for value in true_values:
@@ -84,7 +85,7 @@ class UtilsTestCase(unittest.TestCase):
             i = i + 1
 
         false_values = ['False', False, 'false', 'T', 'F', 'FALSE',
-                        '0', 0, 9, 'off', 'OFF']
+                        '0', 0, 9, 'off', 'OFF', 'no', 'n', 'NO', 'N']
 
         for value in false_values:
             self.assertFalse(utils.bool_from_string(value),
@@ -145,3 +146,32 @@ class UtilsTestCase(unittest.TestCase):
                 self.assertTrue(ciphertext != plaintext)
                 text = crypt.urlsafe_decrypt(key, ciphertext)
                 self.assertTrue(plaintext == text)
+
+    def test_empty_metadata_headers(self):
+        """Ensure unset metadata is not encoded in HTTP headers"""
+
+        metadata = {
+            'foo': 'bar',
+            'snafu': None,
+            'bells': 'whistles',
+            'unset': None,
+            'empty': '',
+            'properties': {
+                'distro': '',
+                'arch': None,
+                'user': 'nobody',
+            },
+        }
+
+        headers = utils.image_meta_to_http_headers(metadata)
+
+        self.assertFalse('x-image-meta-snafu' in headers)
+        self.assertFalse('x-image-meta-uset' in headers)
+        self.assertFalse('x-image-meta-snafu' in headers)
+        self.assertFalse('x-image-meta-property-arch' in headers)
+
+        self.assertEquals(headers.get('x-image-meta-foo'), 'bar')
+        self.assertEquals(headers.get('x-image-meta-bells'), 'whistles')
+        self.assertEquals(headers.get('x-image-meta-empty'), '')
+        self.assertEquals(headers.get('x-image-meta-property-distro'), '')
+        self.assertEquals(headers.get('x-image-meta-property-user'), 'nobody')

@@ -19,6 +19,7 @@
 A simple filesystem-backed store
 """
 
+import errno
 import hashlib
 import logging
 import os
@@ -26,6 +27,7 @@ import urlparse
 
 from glance.common import cfg
 from glance.common import exception
+from glance.common import utils
 import glance.store
 import glance.store.base
 import glance.store.location
@@ -153,7 +155,7 @@ class Store(glance.store.base.Store):
                   from glance.store.location.get_location_from_uri()
 
         :raises NotFound if image does not exist
-        :raises NotAuthorized if cannot delete because of permissions
+        :raises Forbidden if cannot delete because of permissions
         """
         loc = location.store_location
         fn = loc.path
@@ -162,8 +164,7 @@ class Store(glance.store.base.Store):
                 logger.debug(_("Deleting image at %(fn)s") % locals())
                 os.unlink(fn)
             except OSError:
-                raise exception.NotAuthorized(_("You cannot delete file %s")
-                                                % fn)
+                raise exception.Forbidden(_("You cannot delete file %s") % fn)
         else:
             raise exception.NotFound(_("Image file %s does not exist") % fn)
 
@@ -197,15 +198,19 @@ class Store(glance.store.base.Store):
         bytes_written = 0
         try:
             with open(filepath, 'wb') as f:
-                while True:
-                    buf = image_file.read(ChunkedFile.CHUNKSIZE)
-                    if not buf:
-                        break
+                for buf in utils.chunkreadable(image_file,
+                                              ChunkedFile.CHUNKSIZE):
                     bytes_written += len(buf)
                     checksum.update(buf)
                     f.write(buf)
-        except IOError:
-            raise exception.StorageFull()
+        except IOError as e:
+            if e.errno in [errno.EFBIG, errno.ENOSPC]:
+                raise exception.StorageFull()
+            elif e.errno == errno.EACCES:
+                raise exception.StorageWriteDenied()
+            else:
+                raise
+
         checksum_hex = checksum.hexdigest()
 
         logger.debug(_("Wrote %(bytes_written)d bytes to %(filepath)s with "
